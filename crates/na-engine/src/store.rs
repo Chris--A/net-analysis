@@ -191,6 +191,17 @@ impl DeviceStore {
         }
     }
 
+    /// Set the guard's verdict. Only a real change marks the device for the next flush.
+    pub fn set_risk(&mut self, id: DeviceId, risk: f32, reasons: Vec<String>) {
+        if let Some(d) = self.devices.get_mut(&id)
+            && ((d.risk - risk).abs() > 0.005 || d.risk_reasons != reasons)
+        {
+            d.risk = risk;
+            d.risk_reasons = reasons;
+            self.dirty.insert(id);
+        }
+    }
+
     /// Snapshots of every device changed since the last call, after any merge removals.
     pub fn drain_updates(&mut self) -> Vec<EngineEvent> {
         let mut events: Vec<EngineEvent> = self.removed.drain(..).map(EngineEvent::DeviceRemoved).collect();
@@ -228,7 +239,7 @@ fn link_mac(d: &Device) -> Option<MacAddr> {
 }
 
 /// Same OUI (ignoring the locally-administered bit) and within ±8 in the low 24 bits.
-fn macs_related(a: MacAddr, b: MacAddr) -> bool {
+pub(crate) fn macs_related(a: MacAddr, b: MacAddr) -> bool {
     let low = |m: MacAddr| i64::from(u32::from_be_bytes([0, m.0[3], m.0[4], m.0[5]]));
     (a.0[0] | 0x02) == (b.0[0] | 0x02) && a.0[1..3] == b.0[1..3] && (low(a) - low(b)).abs() <= 8
 }

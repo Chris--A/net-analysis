@@ -9,6 +9,7 @@ use na_model::{EngineEvent, Observation, SourceKind, SourceState};
 use tokio_util::sync::CancellationToken;
 
 use crate::EngineConfig;
+use crate::guard::{GuardSignal, KarmaRequest};
 use crate::identify::{BtDb, OuiDb};
 
 pub mod ble;
@@ -62,6 +63,10 @@ pub struct SourceDeps {
     pub bt: Arc<BtDb>,
     /// Live LAN active-probing switch (see `EngineCommand::SetActiveProbes`).
     pub lan_active: tokio::sync::watch::Receiver<bool>,
+    /// Karma test probes for whichever radio source is running (Wi-Fi or simulator).
+    pub karma: flume::Receiver<KarmaRequest>,
+    /// Reports back to the guard.
+    pub guard: flume::Sender<GuardSignal>,
 }
 
 pub trait Source: Send + 'static {
@@ -78,8 +83,8 @@ pub fn make_source(
     deps: &SourceDeps,
 ) -> Result<Box<dyn Source>, String> {
     match kind {
-        SourceKind::Sim => Ok(Box::new(sim::SimSource::new(cfg.sim.clone(), deps.bt.clone()))),
-        SourceKind::Wifi => Ok(Box::new(wifi::WifiSource::new(cfg.wifi.clone(), deps.oui.clone()))),
+        SourceKind::Sim => Ok(Box::new(sim::SimSource::new(cfg.sim.clone(), deps.clone()))),
+        SourceKind::Wifi => Ok(Box::new(wifi::WifiSource::new(cfg.wifi.clone(), deps.clone()))),
         SourceKind::Ble => Ok(Box::new(ble::BleSource::new(cfg.ble.clone(), deps.oui.clone(), deps.bt.clone()))),
         SourceKind::Lan => Ok(Box::new(lan::LanSource::new(cfg.lan.clone(), deps.oui.clone(), deps.lan_active.clone()))),
         SourceKind::Capture => Err("not implemented yet (milestone M5)".into()),

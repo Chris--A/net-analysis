@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
 use bevy::prelude::*;
-use na_engine::{Engine, EngineConfig, EngineHandle, SimConfig};
+use na_engine::{Engine, EngineConfig, EngineHandle, GuardConfig, SimConfig};
 use na_model::{
-    Alert, Device, DeviceId, EngineCommand, EngineEvent, Millis, SourceKind, SourceState,
+    Alert, Device, DeviceId, EngineCommand, EngineEvent, GuardStatus, Millis, SourceKind, SourceState,
     now_millis,
 };
 
@@ -104,6 +104,8 @@ pub struct Registry {
     pub alerts: Vec<Alert>,
     pub log: VecDeque<LogLine>,
     pub sources: BTreeMap<SourceKind, SourceState>,
+    /// Trusted networks and the Karma test, as last reported.
+    pub guard: Option<GuardStatus>,
 }
 
 impl Registry {
@@ -141,6 +143,16 @@ fn start_engine(mut commands: Commands, opts: Res<LaunchOptions>) {
             evil_twin_after: (opts.twin_after_secs > 0)
                 .then(|| Duration::from_secs(opts.twin_after_secs)),
             ..SimConfig::default()
+        },
+        // Simulated networks must never land in the real trusted-network file.
+        guard: if opts.sim {
+            GuardConfig {
+                karma_first_after: Duration::from_secs(8),
+                karma_interval: Some(Duration::from_secs(300)),
+                ..GuardConfig::default()
+            }
+        } else {
+            GuardConfig::persistent()
         },
         ..EngineConfig::default()
     };
@@ -197,6 +209,7 @@ fn ingest_events(
                 reg.push_log(LogKind::Alert, line);
                 reg.alerts.push(alert);
             }
+            EngineEvent::Guard(status) => reg.guard = Some(*status),
             EngineEvent::SourceStatus { source, state } => {
                 if reg.sources.get(&source) != Some(&state) {
                     let line = format!("source {}: {}", source.label(), describe_state(&state));

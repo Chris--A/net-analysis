@@ -3,12 +3,14 @@
 //! [`EngineEvent`](na_model::EngineEvent)s to whichever frontend is attached.
 
 mod engine;
+pub mod guard;
 pub mod identify;
 pub mod parse;
 pub mod sources;
 mod store;
 
 pub use engine::{Engine, EngineConfig, EngineHandle, StalePolicy};
+pub use guard::GuardConfig;
 pub use identify::{BtDb, OuiDb};
 pub use sources::ble::BleConfig;
 pub use sources::lan::LanConfig;

@@ -13,13 +13,14 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::NetworkManagement::WiFi::{
     DOT11_SSID, WLAN_BSS_ENTRY, WLAN_BSS_LIST, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO,
-    WLAN_INTERFACE_INFO_LIST, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory,
-    WlanGetNetworkBssList, WlanOpenHandle, WlanQueryInterface, WlanScan, dot11_BSS_type_any,
+    WLAN_INTERFACE_INFO_LIST, WLAN_PROFILE_INFO, WLAN_PROFILE_INFO_LIST, WlanCloseHandle,
+    WlanEnumInterfaces, WlanFreeMemory, WlanGetNetworkBssList, WlanGetProfile, WlanGetProfileList,
+    WlanOpenHandle, WlanQueryInterface, WlanScan, dot11_BSS_type_any,
     wlan_interface_state_connected, wlan_intf_opcode_current_connection,
 };
 use windows_sys::core::GUID;
 
-use super::{RawBss, WifiError, WifiInterface, WifiScanner};
+use super::{RawBss, SavedNetwork, WifiError, WifiInterface, WifiScanner, parse_wlan_profile};
 
 const LOCATION_HINT: &str = "Windows denied access to Wi-Fi scan data. Enable Settings → Privacy & \
 security → Location: 'Location services', 'Let apps access your location' and 'Let desktop apps \
@@ -188,6 +189,70 @@ impl WifiScanner for WlanScanner {
             self.bss_for(guid, description, &mut out)?;
         }
         Ok(out)
+    }
+
+    fn saved_networks(&mut self) -> Result<Vec<SavedNetwork>, WifiError> {
+        let mut out: Vec<SavedNetwork> = Vec::new();
+        for (guid, _) in self.enum_interfaces()? {
+            for name in self.profile_names(&guid)? {
+                let Some(xml) = self.profile_xml(&guid, &name) else { continue };
+                if let Some(n) = parse_wlan_profile(&xml)
+                    && !out.iter().any(|o| o.ssid == n.ssid)
+                {
+                    out.push(n);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl WlanScanner {
+    fn profile_names(&self, guid: &GUID) -> Result<Vec<Vec<u16>>, WifiError> {
+        let mut list: *mut WLAN_PROFILE_INFO_LIST = ptr::null_mut();
+        // SAFETY: valid handle/guid/out-pointer. The list is freed by WlanMem.
+        check(
+            unsafe { WlanGetProfileList(self.handle, guid, ptr::null(), &mut list) },
+            "WlanGetProfileList",
+        )?;
+        let list = WlanMem(list);
+        // SAFETY: dwNumberOfItems entries follow the header.
+        unsafe {
+            let n = (*list.0).dwNumberOfItems as usize;
+            let first = ptr::addr_of!((*list.0).ProfileInfo).cast::<WLAN_PROFILE_INFO>();
+            Ok((0..n)
+                .map(|i| {
+                    let name = &(*first.add(i)).strProfileName;
+                    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                    name[..end].iter().copied().chain([0]).collect() // NUL-terminated
+                })
+                .collect())
+        }
+    }
+
+    /// The profile as XML. Flags stay 0, so key material (if any) comes back
+    /// encrypted, and the parser ignores it anyway.
+    fn profile_xml(&self, guid: &GUID, name: &[u16]) -> Option<String> {
+        let mut xml: *mut u16 = ptr::null_mut();
+        let mut flags = 0u32;
+        let mut access = 0u32;
+        // SAFETY: `name` is NUL-terminated; out-pointers are valid.
+        let rc = unsafe {
+            WlanGetProfile(self.handle, guid, name.as_ptr(), ptr::null(), &mut xml, &mut flags, &mut access)
+        };
+        if rc != ERROR_SUCCESS || xml.is_null() {
+            return None;
+        }
+        let mem = WlanMem(xml);
+        // SAFETY: the API returns a NUL-terminated wide string.
+        let text = unsafe {
+            let mut len = 0;
+            while *mem.0.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(mem.0, len))
+        };
+        Some(text)
     }
 }
 

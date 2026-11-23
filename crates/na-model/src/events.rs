@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Alert, Device, DeviceDetails, DeviceId, DeviceKey, Evidence, Millis};
+use crate::{Alert, Device, DeviceDetails, DeviceId, DeviceKey, Evidence, GuardStatus, MacAddr, Millis};
 
 /// One sighting of a device by one source. The store merges these into `Device`s.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -60,6 +60,8 @@ pub enum EngineEvent {
     DeviceRemoved(DeviceId),
     Alert(Alert),
     SourceStatus { source: SourceKind, state: SourceState },
+    /// Trusted networks and Karma test state changed.
+    Guard(Box<GuardStatus>),
 }
 
 /// Frontend → engine.
@@ -69,5 +71,13 @@ pub enum EngineCommand {
     /// LAN active probing: subnet sweep and port/banner checks. Off by default;
     /// only for networks you own or are authorized to test.
     SetActiveProbes { enabled: bool },
+    /// Remember every currently visible access point of this network that has no warnings.
+    TrustNetwork { ssid: String },
+    /// Remember one access point as legitimate for its network, even if it was flagged.
+    TrustAccessPoint { bssid: MacAddr },
+    /// Drop the learned baseline for a network.
+    ForgetNetwork { ssid: String },
+    /// Run the Karma test now: probe for a random network name and see who answers.
+    RunKarmaTest,
     Shutdown,
 }

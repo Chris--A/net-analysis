@@ -16,7 +16,7 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
 use na_engine::BtDb;
-use na_model::{Device, DeviceKind};
+use na_model::{Device, DeviceKind, MacAddr};
 
 use crate::bridge::{DeviceNode, EngineLink, Registry};
 use crate::picking::Selection;
@@ -47,6 +47,8 @@ pub struct UiState {
     pub active_probes: bool,
     /// The "enable active probing?" confirmation is open.
     pub confirm_active: bool,
+    /// "Trust this flagged access point?" confirmation: (BSSID, SSID).
+    pub confirm_trust: Option<(MacAddr, String)>,
 }
 
 impl Default for UiState {
@@ -57,6 +59,7 @@ impl Default for UiState {
             shown_kinds: DeviceKind::ALL.into_iter().collect(),
             active_probes: false,
             confirm_active: false,
+            confirm_trust: None,
         }
     }
 }
@@ -119,9 +122,10 @@ fn ui_system(
 
     let view = *view.get();
     topbar::show(&mut root, view, &mut next_view, &mut ui_state, &reg, link.as_deref(), fps);
-    alerts::show(&mut root, &reg, &mut sel);
+    alerts::show(&mut root, &reg, &mut sel, link.as_deref());
     device_list::show(&mut root, &mut ui_state, &reg, &mut sel);
-    inspector::show(&mut root, &reg, &mut sel, &bt.0);
+    inspector::show(&mut root, &reg, &mut sel, &mut ui_state, link.as_deref(), &bt.0);
+    inspector::confirm_trust(&ctx, &mut ui_state, &reg, link.as_deref());
 
     let central = root.available_rect_before_wrap();
     let (ref mut cam, cam_tf) = *camera;

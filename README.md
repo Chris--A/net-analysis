@@ -14,8 +14,8 @@ Written in Rust: a headless engine plus a [Bevy](https://bevyengine.org) + egui 
 | **M1** | Windows Wi-Fi scanning (wlanapi), 802.11 IE parser, OUI vendor lookup | ✅ done |
 | **M2** | Bluetooth LE + Classic scanning, AD parser, vendor-protocol decoders | ✅ done |
 | **M3** | LAN discovery: ARP table, mDNS, SSDP/UPnP, NetBIOS, opt-in port/banner probes | ✅ done |
-| M4 | Guard: evil twin, downgrade, Karma, PMF, baselines, alerts | next |
-| M5 | Packet capture (Npcap/libpcap): DHCP/TCP fingerprints, ARP spoof, rogue DHCP | |
+| **M4** | Guard: trusted-network baselines, evil twin, downgrade, Karma, PMF, alerts | ✅ done |
+| M5 | Packet capture (Npcap/libpcap): DHCP/TCP fingerprints, ARP spoof, rogue DHCP | next |
 | M6 | Linux port (nl80211, BlueZ, rtnetlink), monitor-mode detectors | |
 | M7 | Time scrubber, export, packaging, CI | |
 
@@ -63,7 +63,27 @@ Identification uses:
 
 A host first seen only by IP merges into its MAC-keyed device once ARP resolves it. A LAN MAC that sits next to a BSSID (the router, or a phone hotspot) is linked to that AP.
 
-**Simulator.** `--sim` replaces the real scanners with a synthetic world: a home mesh, neighbours, LAN hosts and BLE devices. After 20 s an **evil twin** of `HomeNet` appears (open, locally-administered BSSID, just-booted TSF). A "SIMULATED DATA" badge shows while it runs.
+**Guard (M4).** Every access point is checked against a baseline of your **trusted networks**. Trust comes from three places:
+- your **saved Wi-Fi profiles**, which give each network's expected security. Only names and security settings are read, never keys.
+- **connecting with a password**. Only an AP that knows the key can complete a WPA2/WPA3/Enterprise handshake, so the connected AP and its sibling radios (MACs next to it, same settings) are learned automatically. Connecting to an open network proves nothing, so it teaches nothing.
+- **you**, with *Trust this access point* / *Trust "network"* in the inspector. Trusting a flagged AP asks first.
+
+Baselines are stored in `%LOCALAPPDATA%\net-analysis\guard.json` (`~/.local/share/net-analysis/` on Linux). The simulator never touches that file.
+
+| Detector | Severity |
+|---|---|
+| **Security downgrade**: a trusted name advertised open, or WPA2 where the network is WPA3-only | Critical |
+| **Karma test**: every 10 minutes (or *Run Karma test*), probe for a random name like `Lounge-3F9A1C`; anything that answers is a Karma/MANA rogue AP | Critical |
+| **Evil twin**: an unknown BSSID for a trusted network whose vendor prefix differs, that clones a known BSSID with the local bit flipped, or whose capability fingerprint differs from the known APs on that band | High (Medium if only the fingerprint differs) |
+| **One radio, several names**: one BSSID announcing 2+ (Medium) or 3+ (High) network names | Medium / High |
+| **No 802.11w** where the known APs protect management frames | Medium |
+| **Mixed security** (no baseline): an open AP sharing a name with password-protected ones | Medium |
+
+A locally-administered BSSID and a just-booted radio (TSF uptime) only *corroborate*: they add weight and explanation to a real finding but never raise an alert on their own, because phone hotspots and mesh systems do both legitimately.
+
+Each AP gets a risk score (noisy-OR of its findings) and its findings in plain language. Risky devices pulse red and wear a halo in every view. An alert fires once per device, and again only if it gets worse. The bottom panel shows the guard status, a timeline of alerts, and each alert's reasoning.
+
+**Simulator.** `--sim` replaces the real scanners with a synthetic world: a home mesh, neighbours, LAN hosts and BLE devices. After 20 s an **evil twin** of `HomeNet` appears (open, locally-administered BSSID, just-booted TSF). After 5 s a **Karma AP** starts cycling through public network names and answers the guard's decoy probes. A "SIMULATED DATA" badge shows while it runs.
 
 ## Setup
 
@@ -112,6 +132,8 @@ cargo run -p na-platform --example bt_probe 10 inquiry   # raw platform output, 
 cargo run -p na-cli -- lan                        # LAN hosts (passive + standard discovery)
 cargo run -p na-cli -- lan --secs 30 --active     # + subnet sweep and port/banner probes (your networks only)
 cargo run -p na-platform --example net_probe      # interfaces, gateway, ARP table
+cargo run -p na-cli -- guard                      # trusted networks, Karma test, findings (20 s)
+cargo run -p na-cli -- guard --sim                # same against the simulated evil twin + Karma AP
 cargo run -p na-cli -- sim --secs 5
 
 # Tests
@@ -125,6 +147,8 @@ Cross-check the scanner against the OS with `netsh wlan show networks mode=bssid
 - **Click** a device to inspect it. **Esc** clears the selection.
 - Click a source chip in the top bar to start or stop that source. Hover a chip to see why a source is unavailable.
 - **Active probes** in the top bar turns LAN probing on, after a confirmation, and off again.
+- Click an alert (or its dot on the timeline) to select the device and expand the alert's reasoning.
+- **Run Karma test** in the bottom panel runs the test immediately.
 
 ## Layout
 
@@ -135,7 +159,7 @@ crates/
     src/wifi/windows.rs        Native Wi-Fi API (wlanapi.dll)
     src/bluetooth/windows.rs   WinRT LE watcher + device enumeration, Win32 Classic inquiry
     src/net/                   interfaces/gateway (netdev), ARP table (GetIpNetTable2, /proc/net/arp), SMBIOS
-  na-engine/     tokio engine on its own thread: sources → DeviceStore → identify → (guard)
+  na-engine/     tokio engine on its own thread: sources → DeviceStore → identify → guard
     src/parse/ie.rs           802.11 information-element decoder + fingerprint
     src/parse/ble_ad.rs       BLE advertising-data decoder
     src/parse/{dns,upnp,netbios}.rs   mDNS/DNS-SD, SSDP + UPnP description + HTTP, NBSTAT
@@ -146,13 +170,15 @@ crates/
     src/identify/             OUI + Bluetooth SIG registries, AP and Bluetooth evidence
                               (Continuity, CDP, Fast Pair, appearance, CoD), LAN rules
                               (UPnP, TXT, services, banners, host names), noisy-OR classifier
+    src/guard/                baselines (JSON + saved-profile import), AP detectors,
+                              Karma test, risk scores and alerts
   na-cli/        `na` binary: headless JSON/table output for testing
   na-app/        Bevy + egui frontend
     src/bridge.rs   engine events → Registry resource + one entity per device
     src/views/      radar / constellation / spectrum: each only writes LayoutTargets
     src/tween.rs    eases entities toward targets, so view switches morph
-    src/scene.rs    cameras, bloom, colour language, material updates
-    src/ui/         top bar, device list, inspector (incl. raw IEs / AD), alerts/log, overlay
+    src/scene.rs    cameras, bloom, colour language, material updates, risk halos
+    src/ui/         top bar, device list, inspector (incl. raw IEs / AD, guard), alerts/timeline/log, overlay
 scripts/         fetch-data.{ps1,sh}
 ```
 
@@ -161,6 +187,8 @@ scripts/         fetch-data.{ps1,sh}
 ## Platform notes
 
 - **Locally-administered BSSIDs are common and legitimate**: phone hotspots, mesh systems and multi-SSID APs use them. On its own, one is weak evidence of spoofing.
+- **The Karma test** sends an ordinary directed probe request (what every phone does for its saved networks), so it's fine on any network. Some drivers ignore directed scans; a test that couldn't send is reported as *couldn't run*, never as *clean*.
+- **A perfect clone** (same BSSID, same security and capabilities) is indistinguishable from beacons alone. Packet capture (M5) and monitor mode (M6) add the gateway, DHCP, and deauth/sequence checks that can catch one.
 - **Bluetooth and Wi-Fi share an antenna** on most laptop cards. The default LE scan uses Windows' coexistence-friendly duty cycle. `--fast` and Classic inquiry briefly take airtime from Wi-Fi, so inquiry runs only every 90 s for 5 s.
 - **Classic discovery** finds only devices that are discoverable right now: pairing mode, or a Bluetooth settings page open. Phones and headphones in normal use don't answer.
 - **Packet capture**: needs [Npcap](https://npcap.com) on Windows, or libpcap with `cap_net_raw,cap_net_admin` on Linux.

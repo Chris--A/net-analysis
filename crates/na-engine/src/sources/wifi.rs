@@ -5,7 +5,6 @@
 //! blocking thread for the lifetime of the source.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -16,7 +15,8 @@ use na_model::{
 use na_platform::wifi::{RawBss, WifiError, frequency_to_channel, open_scanner};
 use tracing::{debug, warn};
 
-use super::{BoxFuture, Source, SourceCtx};
+use super::{BoxFuture, Source, SourceCtx, SourceDeps};
+use crate::guard::GuardSignal;
 use crate::identify::{OuiDb, ap_evidence};
 use crate::parse::ie;
 
@@ -39,12 +39,12 @@ impl Default for WifiConfig {
 
 pub struct WifiSource {
     cfg: WifiConfig,
-    oui: Arc<OuiDb>,
+    deps: SourceDeps,
 }
 
 impl WifiSource {
-    pub fn new(cfg: WifiConfig, oui: Arc<OuiDb>) -> Self {
-        Self { cfg, oui }
+    pub fn new(cfg: WifiConfig, deps: SourceDeps) -> Self {
+        Self { cfg, deps }
     }
 }
 
@@ -55,14 +55,15 @@ impl Source for WifiSource {
 
     fn run(self: Box<Self>, ctx: SourceCtx) -> BoxFuture<anyhow::Result<()>> {
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || scan_loop(&self.cfg, &self.oui, &ctx))
+            tokio::task::spawn_blocking(move || scan_loop(&self.cfg, &self.deps, &ctx))
                 .await
                 .map_err(|e| anyhow!("Wi-Fi scan thread panicked: {e}"))?
         })
     }
 }
 
-fn scan_loop(cfg: &WifiConfig, oui: &OuiDb, ctx: &SourceCtx) -> anyhow::Result<()> {
+fn scan_loop(cfg: &WifiConfig, deps: &SourceDeps, ctx: &SourceCtx) -> anyhow::Result<()> {
+    let oui: &OuiDb = &deps.oui;
     let mut scanner = match open_scanner() {
         Ok(s) => s,
         Err(WifiError::Unsupported(why)) => {
@@ -86,6 +87,16 @@ fn scan_loop(cfg: &WifiConfig, oui: &OuiDb, ctx: &SourceCtx) -> anyhow::Result<(
                 debug!(error = %e, "scan request failed");
             }
             last_scan = Some(Instant::now());
+        }
+
+        // Karma test: a directed probe for the guard's decoy name.
+        while let Ok(req) = deps.karma.try_recv() {
+            if req.is_stale(now_millis()) {
+                continue;
+            }
+            let result = scanner.trigger_scan(Some(req.ssid.as_bytes())).map_err(|e| e.to_string());
+            debug!(decoy = %req.ssid, ?result, "Karma probe");
+            let _ = deps.guard.send(GuardSignal::KarmaSent { ssid: req.ssid, result });
         }
 
         let connected: HashSet<MacAddr> = scanner

@@ -161,6 +161,9 @@ pub struct Device {
     pub evidence: Vec<Evidence>,
     /// 0.0 (benign) to 1.0 (almost certainly hostile), set by the guard detectors.
     pub risk: f32,
+    /// The guard's current findings behind `risk`, one sentence each.
+    #[serde(default)]
+    pub risk_reasons: Vec<String>,
     pub links: Vec<DeviceId>,
 }
 
@@ -178,6 +181,7 @@ impl Device {
             identity: Identity::default(),
             evidence: Vec::new(),
             risk: 0.0,
+            risk_reasons: Vec::new(),
             links: Vec::new(),
         }
     }

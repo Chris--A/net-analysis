@@ -6,6 +6,7 @@ use na_model::{EngineCommand, EngineEvent, SourceKind, SourceState, now_millis};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::guard::{Guard, GuardConfig, GuardSignal};
 use crate::identify::{BtDb, OuiDb};
 use crate::sources::{self, ObservationSink, SourceCtx, SourceDeps};
 use crate::{BleConfig, DeviceStore, LanConfig, SimConfig, WifiConfig};
@@ -41,6 +42,7 @@ pub struct EngineConfig {
     pub wifi: WifiConfig,
     pub ble: BleConfig,
     pub lan: LanConfig,
+    pub guard: GuardConfig,
     /// How often changed devices are pushed to the frontend.
     pub flush_interval: Duration,
     pub stale: StalePolicy,
@@ -54,6 +56,7 @@ impl Default for EngineConfig {
             wifi: WifiConfig::default(),
             ble: BleConfig::default(),
             lan: LanConfig::default(),
+            guard: GuardConfig::default(),
             flush_interval: Duration::from_millis(200),
             stale: StalePolicy::default(),
         }
@@ -144,12 +147,26 @@ async fn run(
         tokio::task::spawn_blocking(BtDb::load_default),
     );
     let (lan_active, lan_active_rx) = tokio::sync::watch::channel(cfg.lan.active);
+    let (karma_tx, karma_rx) = flume::bounded(4);
+    let (guard_tx, guard_rx) = flume::unbounded();
+    let mut guard = Guard::new(&cfg.guard, karma_tx, now_millis());
+    if cfg.guard.import_saved_profiles {
+        let tx = guard_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let saved = na_platform::wifi::open_scanner()
+                .and_then(|mut s| s.saved_networks())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(GuardSignal::SavedNetworks(saved));
+        });
+    }
     let spawner = Spawner {
         cfg: &cfg,
         deps: SourceDeps {
             oui: std::sync::Arc::new(oui.unwrap_or_default()),
             bt: std::sync::Arc::new(bt.unwrap_or_default()),
             lan_active: lan_active_rx,
+            karma: karma_rx,
+            guard: guard_tx,
         },
         obs_tx: &obs_tx,
         evt_tx: &evt_tx,
@@ -167,7 +184,11 @@ async fn run(
     info!("engine started");
     loop {
         tokio::select! {
-            Some(obs) = obs_rx.recv() => store.ingest(obs),
+            Some(obs) = obs_rx.recv() => {
+                guard.observe(&obs);
+                store.ingest(obs);
+            }
+            Ok(sig) = guard_rx.recv_async() => guard.signal(sig, now_millis()),
             cmd = cmd_rx.recv_async() => match cmd {
                 Ok(EngineCommand::SetSourceEnabled { source, enabled: true }) => {
                     spawner.start(source, &mut running);
@@ -182,22 +203,39 @@ async fn run(
                     let _ = lan_active.send(enabled);
                 }
                 Ok(EngineCommand::Shutdown) | Err(_) => break,
+                Ok(other) => {
+                    let radio = radio_running(&running);
+                    if guard.command(&other, &store, now_millis(), radio) {
+                        // Show the effect (risk, trust status) right away.
+                        if !send_all(&evt_tx, guard.tick(&mut store, now_millis(), radio)) { break; }
+                    }
+                }
             },
             _ = flush.tick() => {
                 if !send_all(&evt_tx, store.drain_updates()) { break; }
             }
             _ = sweep.tick() => {
                 running.retain(|_, r| !r.task.is_finished());
-                if !send_all(&evt_tx, store.sweep_stale(now_millis())) { break; }
+                let now = now_millis();
+                if !send_all(&evt_tx, store.sweep_stale(now)) { break; }
+                if !send_all(&evt_tx, guard.tick(&mut store, now, radio_running(&running))) { break; }
             }
         }
     }
 
+    guard.shutdown();
     for (_, r) in running.drain() {
         r.cancel.cancel();
         let _ = r.task.await;
     }
     info!("engine stopped");
+}
+
+/// A source that can send Karma probes is up.
+fn radio_running(running: &HashMap<SourceKind, RunningSource>) -> bool {
+    [SourceKind::Wifi, SourceKind::Sim]
+        .iter()
+        .any(|k| running.get(k).is_some_and(|r| !r.task.is_finished()))
 }
 
 /// Returns false once the frontend has gone away.

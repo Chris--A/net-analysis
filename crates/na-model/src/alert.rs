@@ -23,7 +23,7 @@ impl Severity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AlertKind {
     EvilTwin,
     SecurityDowngrade,
@@ -39,6 +39,25 @@ pub enum AlertKind {
     Other,
 }
 
+impl AlertKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EvilTwin => "Evil twin",
+            Self::SecurityDowngrade => "Security downgrade",
+            Self::RandomizedBssid => "Randomized BSSID",
+            Self::TsfAnomaly => "Uptime anomaly",
+            Self::KarmaAp => "Karma/MANA AP",
+            Self::MultiSsid => "Many networks, one radio",
+            Self::PmfMissing => "No management-frame protection",
+            Self::GatewayChange => "Gateway change",
+            Self::RogueDhcp => "Rogue DHCP",
+            Self::ArpSpoof => "ARP spoofing",
+            Self::DeauthFlood => "Deauth flood",
+            Self::Other => "Other",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Alert {
     pub id: u64,
@@ -49,4 +68,7 @@ pub struct Alert {
     pub title: String,
     /// Plain-language reasoning: why the app raised this alert.
     pub explanation: String,
+    /// The individual observations behind it, one sentence each.
+    #[serde(default)]
+    pub findings: Vec<String>,
 }

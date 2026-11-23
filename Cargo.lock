@@ -4084,6 +4084,8 @@ dependencies = [
  "flume",
  "na-model",
  "na-platform",
+ "serde",
+ "serde_json",
  "socket2",
  "tokio",
  "tokio-util",

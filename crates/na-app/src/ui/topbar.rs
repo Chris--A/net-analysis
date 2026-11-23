@@ -90,6 +90,16 @@ pub fn show(
                 if ui_state.paused {
                     ui.label(RichText::new("PAUSED").strong().color(WARN));
                 }
+                let flagged = reg.devices.values().filter(|d| d.risk >= 0.3).count();
+                if flagged > 0 {
+                    ui.label(
+                        RichText::new(format!(" ⚠ {flagged} flagged "))
+                            .strong()
+                            .color(egui::Color32::BLACK)
+                            .background_color(DANGER),
+                    )
+                    .on_hover_text("Devices the guard considers risky. They pulse red and wear a halo in the 3D views.");
+                }
                 if let Some(fps) = fps {
                     ui.label(RichText::new(format!("{fps:.0} fps")).small().color(WEAK));
                 }

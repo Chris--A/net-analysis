@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use na_engine::identify::ble::describe_manufacturer;
-use na_engine::{BleConfig, BtDb, Engine, EngineConfig, LanConfig, SimConfig};
-use na_model::{Alert, Device, DeviceDetails, DeviceId, EngineEvent, SourceKind, SourceState};
+use na_engine::{BleConfig, BtDb, Engine, EngineConfig, GuardConfig, LanConfig, SimConfig};
+use na_model::{
+    Alert, Device, DeviceDetails, DeviceId, EngineEvent, GuardStatus, KarmaOutcome, SourceKind, SourceState,
+};
 
 #[derive(Parser)]
 #[command(name = "na", version, about = "Wireless & LAN device analyzer (headless)")]
@@ -61,6 +63,21 @@ enum Cmd {
         /// Only on networks you own or are authorized to test.
         #[arg(long)]
         active: bool,
+    },
+    /// Check nearby Wi-Fi for evil twins, downgrades and Karma APs against your trusted networks.
+    Guard {
+        /// How long to watch (the Karma test needs about 17 s).
+        #[arg(long, default_value_t = 20)]
+        secs: u64,
+        /// Emit JSON instead of a report.
+        #[arg(long)]
+        json: bool,
+        /// Use the simulator (evil twin + Karma AP) instead of the real adapter.
+        #[arg(long)]
+        sim: bool,
+        /// Skip the Karma test (no probe for a decoy network name is sent).
+        #[arg(long)]
+        no_karma: bool,
     },
     /// Scan nearby Wi-Fi access points with this machine's adapter.
     Wifi {
@@ -130,6 +147,27 @@ fn main() -> Result<()> {
                 snapshot.print_lan_table();
             }
         }
+        Cmd::Guard { secs, json, sim, no_karma } => {
+            let mut guard = if sim { GuardConfig::default() } else { GuardConfig::persistent() };
+            guard.karma_interval = (!no_karma).then_some(Duration::from_secs(3600));
+            guard.karma_first_after = Duration::from_secs(2);
+            let cfg = EngineConfig {
+                sources: vec![if sim { SourceKind::Sim } else { SourceKind::Wifi }],
+                sim: SimConfig {
+                    evil_twin_after: Some(Duration::from_secs(4)),
+                    karma_ap_after: Some(Duration::from_secs(1)),
+                    ..SimConfig::default()
+                },
+                guard,
+                ..EngineConfig::default()
+            };
+            let snapshot = collect(cfg, Duration::from_secs(secs))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshot.to_json())?);
+            } else {
+                snapshot.print_guard();
+            }
+        }
         Cmd::Wifi { secs, json } => {
             let cfg = EngineConfig {
                 sources: vec![SourceKind::Wifi],
@@ -150,6 +188,7 @@ struct Snapshot {
     devices: HashMap<DeviceId, Device>,
     alerts: Vec<Alert>,
     sources: BTreeMap<SourceKind, SourceState>,
+    guard: Option<GuardStatus>,
 }
 
 fn collect(cfg: EngineConfig, dur: Duration) -> Result<Snapshot> {
@@ -158,6 +197,7 @@ fn collect(cfg: EngineConfig, dur: Duration) -> Result<Snapshot> {
         devices: HashMap::new(),
         alerts: Vec::new(),
         sources: BTreeMap::new(),
+        guard: None,
     };
     let deadline = Instant::now() + dur;
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
@@ -172,6 +212,7 @@ fn collect(cfg: EngineConfig, dur: Duration) -> Result<Snapshot> {
             Ok(EngineEvent::SourceStatus { source, state }) => {
                 snap.sources.insert(source, state);
             }
+            Ok(EngineEvent::Guard(g)) => snap.guard = Some(*g),
             Err(_) => break,
         }
     }
@@ -195,6 +236,7 @@ impl Snapshot {
             "sources": self.sources.iter().map(|(k, v)| (k.label(), format!("{v:?}"))).collect::<BTreeMap<_, _>>(),
             "devices": self.sorted(),
             "alerts": self.alerts,
+            "guard": self.guard,
         })
     }
 
@@ -224,9 +266,75 @@ impl Snapshot {
             );
         }
         println!("\n{} devices, {} alerts", self.devices.len(), self.alerts.len());
+        self.print_alerts();
+    }
+
+    fn print_alerts(&self) {
         for a in &self.alerts {
-            println!("[{}] {}: {}", a.severity.label(), a.title, a.explanation);
+            println!("[{}] {}", a.severity.label(), a.title);
+            println!("    {}", a.explanation);
+            for f in &a.findings {
+                println!("    - {f}");
+            }
         }
+    }
+
+    fn print_guard(&self) {
+        for (k, v) in &self.sources {
+            eprintln!("source {:<8} {v:?}", k.label());
+        }
+        let Some(g) = &self.guard else {
+            println!("(no guard status received)");
+            return;
+        };
+        if let Some(msg) = &g.profile_import {
+            println!("{msg}");
+        }
+        let learned: Vec<_> = g.networks.iter().filter(|n| !n.known.is_empty()).collect();
+        println!(
+            "{} trusted networks, {} with known access points",
+            g.networks.len(),
+            learned.len()
+        );
+        for n in learned {
+            let expects = n.expected.as_ref().map_or("-", |e| e.auth.as_str());
+            let aps: Vec<String> =
+                n.known.iter().map(|k| format!("{} ({}, {} ch{})", k.bssid, k.source.label(), k.band.label(), k.channel)).collect();
+            println!("  {:<28} {:<9} {}", truncate(&n.ssid, 28), expects, aps.join(", "));
+        }
+
+        match &g.karma.last {
+            Some(r) => match &r.outcome {
+                KarmaOutcome::NoResponse => println!("Karma test: probed for \"{}\"; no access point answered.", r.decoy),
+                KarmaOutcome::Responders(v) => {
+                    let who: Vec<String> = v.iter().map(ToString::to_string).collect();
+                    println!("Karma test: probed for \"{}\"; ANSWERED BY {}", r.decoy, who.join(", "));
+                }
+                KarmaOutcome::Failed(why) => println!("Karma test: couldn't run ({why})"),
+            },
+            None if g.karma.running => println!("Karma test: still listening (use a longer --secs)"),
+            None => println!("Karma test: not run"),
+        }
+
+        let aps: Vec<&Device> = self.sorted().into_iter().filter(|d| d.ap().is_some()).collect();
+        let mut risky: Vec<&&Device> = aps.iter().filter(|d| d.risk > 0.0).collect();
+        risky.sort_by(|a, b| b.risk.total_cmp(&a.risk));
+        println!("\n{} access points checked, {} with findings", aps.len(), risky.len());
+        for d in risky {
+            let ap = d.ap().expect("filtered");
+            println!(
+                "  {:>3.0}%  {:<24} {:<18} {}",
+                d.risk * 100.0,
+                truncate(ap.display_ssid(), 24),
+                ap.bssid,
+                ap.security.label()
+            );
+            for r in &d.risk_reasons {
+                println!("        - {r}");
+            }
+        }
+        println!("\n{} alerts", self.alerts.len());
+        self.print_alerts();
     }
 }
 

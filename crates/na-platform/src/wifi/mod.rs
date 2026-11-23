@@ -68,6 +68,78 @@ pub trait WifiScanner {
 
     /// The OS's current BSS cache across all interfaces.
     fn bss_list(&mut self) -> Result<Vec<RawBss>, WifiError>;
+
+    /// Networks saved in the OS, deduplicated by SSID. Only names and security
+    /// settings are read; keys are never requested.
+    fn saved_networks(&mut self) -> Result<Vec<SavedNetwork>, WifiError>;
+}
+
+/// A Wi-Fi network the OS remembers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedNetwork {
+    pub profile: String,
+    pub ssid: String,
+    /// The OS's authentication name: `open`, `WPA2PSK`, `WPA3SAE`, `WPA2`, `OWE`…
+    pub auth: String,
+    /// `none`, `WEP`, `TKIP`, `AES`, `GCMP256`…
+    pub encryption: String,
+    /// A WPA3 profile that also accepts WPA2 (transition mode).
+    pub transition: bool,
+    pub auto_connect: bool,
+    /// The network doesn't broadcast its name.
+    pub hidden: bool,
+}
+
+/// Parse a Windows WLAN profile (`WLANProfile` XML). Returns None for ad-hoc
+/// (IBSS) profiles and anything without an SSID. Key material is ignored.
+pub fn parse_wlan_profile(xml: &str) -> Option<SavedNetwork> {
+    if tag(xml, "connectionType").is_some_and(|t| t.eq_ignore_ascii_case("IBSS")) {
+        return None;
+    }
+    let ssid_block = tag(xml, "SSID")?;
+    let ssid = tag(ssid_block, "hex")
+        .and_then(hex_bytes)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .or_else(|| tag(ssid_block, "name").map(unescape))?;
+    let auth_block = tag(xml, "authEncryption").unwrap_or_default();
+    Some(SavedNetwork {
+        profile: tag(xml, "name").map(unescape).unwrap_or_else(|| ssid.clone()),
+        ssid,
+        auth: tag(auth_block, "authentication").unwrap_or("open").to_owned(),
+        encryption: tag(auth_block, "encryption").unwrap_or("none").to_owned(),
+        transition: tag(auth_block, "transitionMode").is_some_and(|v| v.eq_ignore_ascii_case("true")),
+        auto_connect: tag(xml, "connectionMode").is_none_or(|v| v.eq_ignore_ascii_case("auto")),
+        hidden: tag(xml, "nonBroadcast").is_some_and(|v| v.eq_ignore_ascii_case("true")),
+    })
+}
+
+/// Contents of the first `<name ...>…</name>` (namespaced attributes allowed).
+fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}");
+    let mut from = 0;
+    while let Some(i) = xml[from..].find(&open) {
+        let start = from + i + open.len();
+        match xml[start..].chars().next() {
+            Some('>' | ' ' | '\t' | '\r' | '\n') => {
+                let gt = start + xml[start..].find('>')? + 1;
+                let end = gt + xml[gt..].find(&format!("</{name}>"))?;
+                return Some(xml[gt..end].trim());
+            }
+            _ => from = start,
+        }
+    }
+    None
+}
+
+fn hex_bytes(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || s.is_empty() {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
 /// Open the platform's Wi-Fi scanner.
@@ -102,6 +174,51 @@ mod tests {
     use na_model::Band;
 
     use super::*;
+
+    #[test]
+    fn wlan_profile_fields() {
+        let xml = r#"<?xml version="1.0"?>
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+	<name>Home &amp; Garden</name>
+	<SSIDConfig>
+		<SSID>
+			<hex>486F6D6520262047617264656E</hex>
+			<name>Home &amp; Garden</name>
+		</SSID>
+	</SSIDConfig>
+	<connectionType>ESS</connectionType>
+	<connectionMode>auto</connectionMode>
+	<MSM>
+		<security>
+			<authEncryption>
+				<authentication>WPA3SAE</authentication>
+				<encryption>AES</encryption>
+				<useOneX>false</useOneX>
+				<transitionMode xmlns="http://www.microsoft.com/networking/WLAN/profile/v4">true</transitionMode>
+			</authEncryption>
+			<sharedKey>
+				<keyType>passPhrase</keyType>
+				<protected>true</protected>
+				<keyMaterial>01000000D08C9DDF0115</keyMaterial>
+			</sharedKey>
+		</security>
+	</MSM>
+</WLANProfile>"#;
+        let n = parse_wlan_profile(xml).unwrap();
+        assert_eq!(n.ssid, "Home & Garden");
+        assert_eq!(n.profile, "Home & Garden");
+        assert_eq!((n.auth.as_str(), n.encryption.as_str()), ("WPA3SAE", "AES"));
+        assert!(n.transition && n.auto_connect && !n.hidden);
+
+        let open = "<WLANProfile><name>Cafe</name><SSIDConfig><SSID><name>Cafe</name></SSID>\
+            <nonBroadcast>true</nonBroadcast></SSIDConfig><connectionMode>manual</connectionMode>\
+            <MSM><security><authEncryption><authentication>open</authentication><encryption>none</encryption>\
+            </authEncryption></security></MSM></WLANProfile>";
+        let n = parse_wlan_profile(open).unwrap();
+        assert_eq!((n.ssid.as_str(), n.auth.as_str()), ("Cafe", "open"));
+        assert!(n.hidden && !n.auto_connect && !n.transition);
+        assert_eq!(parse_wlan_profile("<WLANProfile><connectionType>IBSS</connectionType></WLANProfile>"), None);
+    }
 
     #[test]
     fn channels_from_frequency() {

@@ -1,6 +1,6 @@
 //! `--screenshot-dir DIR`: a scripted tour for visual verification.
-//! It captures each view, then the inspector with the evil twin, a BLE device and a
-//! Classic device selected, then exits.
+//! It captures each view, then the inspector with the evil twin, a BLE device, a
+//! Classic device, a LAN host and the Karma AP selected, then exits.
 //! Combine with `--twin-after 3` so the twin is present early.
 
 use std::path::{Path, PathBuf};
@@ -148,6 +148,35 @@ fn run_tour(
         }
         12 => {
             ui_state.confirm_active = false;
+            // The Karma AP: the riskiest device that isn't the evil twin.
+            sel.selected = reg
+                .devices
+                .values()
+                .filter(|d| d.ap().is_some_and(|a| a.bssid.is_locally_administered() && a.channel == 11))
+                .max_by(|a, b| a.risk.total_cmp(&b.risk))
+                .map(|d| d.id);
+            next_view.set(ViewMode::Spectrum);
+            (4.0, false)
+        }
+        13 => {
+            shot(&mut commands, &dir, "9-karma-selected.png");
+            (0.5, false)
+        }
+        14 => {
+            // Trusting a flagged AP asks first.
+            ui_state.confirm_trust = reg
+                .devices
+                .values()
+                .find(|d| d.ap().is_some_and(|a| a.ssid == "HomeNet" && a.security.is_open()))
+                .and_then(|d| d.ap().map(|a| (a.bssid, a.ssid.clone())));
+            (1.0, false)
+        }
+        15 => {
+            shot(&mut commands, &dir, "10-trust-confirm.png");
+            (0.5, false)
+        }
+        16 => {
+            ui_state.confirm_trust = None;
             (0.5, false)
         }
         _ => (0.0, true),

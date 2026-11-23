@@ -76,8 +76,8 @@ pub enum Cipher {
     Other(u32),
 }
 
-/// Protected Management Frames (802.11w) — blocks trivial deauth attacks.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Protected Management Frames (802.11w) — blocks trivial deauth attacks. Ordered weakest first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Pmf {
     #[default]
     Disabled,

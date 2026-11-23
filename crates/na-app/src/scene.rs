@@ -1,5 +1,5 @@
-//! Cameras, lighting, shared meshes, the colour language, and the per-frame
-//! material update that encodes recency, selection and risk.
+//! Cameras, lighting, shared meshes, the colour language, the per-frame
+//! material update that encodes recency, selection and risk, and risk halos.
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::CameraOutputMode;
@@ -26,7 +26,7 @@ impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ClearColor(BACKGROUND))
             .add_systems(Startup, setup_scene)
-            .add_systems(Update, update_node_visuals.in_set(FrameSet::Visuals));
+            .add_systems(Update, (update_node_visuals, update_risk_halos).in_set(FrameSet::Visuals));
     }
 }
 
@@ -36,6 +36,23 @@ pub struct MainCamera;
 /// "You are here": the scanning host.
 #[derive(Component)]
 pub struct SelfMarker;
+
+/// Devices at or above this risk wear a halo.
+const HALO_RISK: f32 = 0.3;
+
+/// A pulsing ring around a risky device (child of its node, so it follows every view's layout).
+#[derive(Component)]
+struct RiskHalo;
+
+/// On a node: its halo entity.
+#[derive(Component)]
+struct HasHalo(Entity);
+
+#[derive(Resource)]
+struct HaloAssets {
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+}
 
 #[derive(Resource)]
 pub struct NodeAssets {
@@ -143,6 +160,17 @@ fn setup_scene(
         Transform::from_xyz(10.0, 30.0, 15.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
+    commands.insert_resource(HaloAssets {
+        mesh: meshes.add(Torus::new(0.92, 1.0)),
+        material: materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 0.15, 0.08, 0.7),
+            emissive: LinearRgba::rgb(9.0, 0.6, 0.25),
+            unlit: true,
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        }),
+    });
+
     commands.insert_resource(NodeAssets {
         ap: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
         ble: meshes.add(Sphere::new(0.5).mesh().ico(3).unwrap()),
@@ -223,6 +251,48 @@ fn update_node_visuals(
         if let Some(mut m) = materials.get_mut(&material.0) {
             m.emissive = emissive;
             m.base_color = base;
+        }
+    }
+}
+
+/// Add, animate and remove halos as devices cross the risk threshold.
+fn update_risk_halos(
+    mut commands: Commands,
+    time: Res<Time>,
+    reg: Res<Registry>,
+    assets: Option<Res<HaloAssets>>,
+    nodes: Query<(Entity, &DeviceNode, Option<&HasHalo>)>,
+    mut halos: Query<&mut Transform, With<RiskHalo>>,
+) {
+    let Some(assets) = assets else { return };
+    let t = time.elapsed_secs();
+    for (entity, node, halo) in &nodes {
+        let risky = reg.devices.get(&node.id).is_some_and(|d| d.risk >= HALO_RISK);
+        match (risky, halo) {
+            (true, None) => {
+                let h = commands
+                    .spawn((
+                        RiskHalo,
+                        Mesh3d(assets.mesh.clone()),
+                        MeshMaterial3d(assets.material.clone()),
+                        Transform::from_scale(Vec3::splat(1.6)),
+                        Pickable::IGNORE,
+                    ))
+                    .id();
+                commands.entity(entity).add_child(h).insert(HasHalo(h));
+            }
+            (false, Some(h)) => {
+                commands.entity(h.0).despawn();
+                commands.entity(entity).remove::<HasHalo>();
+            }
+            (true, Some(h)) => {
+                if let Ok(mut tf) = halos.get_mut(h.0) {
+                    let pulse = 0.5 + 0.5 * (t * 3.0).sin();
+                    tf.scale = Vec3::splat(1.5 + 0.45 * pulse);
+                    tf.rotation = Quat::from_rotation_x(0.35 * (t * 0.7).sin()) * Quat::from_rotation_y(t * 0.9);
+                }
+            }
+            (false, None) => {}
         }
     }
 }

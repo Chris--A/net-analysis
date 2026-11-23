@@ -233,6 +233,11 @@ pub fn parse(ies: &[u8]) -> ParsedIes {
 
 /// Append the stable part of an element to the fingerprint buffer.
 fn fingerprint_element(fp: &mut Vec<u8>, e: &Element<'_>) {
+    // TIM is in beacons but never in probe responses, and the OS cache holds
+    // whichever arrived last. Counting it would split one AP into two fingerprints.
+    if e.id == 5 {
+        return;
+    }
     fp.push(e.id);
     if let Some(x) = e.ext_id {
         fp.push(x);
@@ -657,6 +662,17 @@ mod tests {
         let a = parse(&base(b"Home", 6, 3, 0)).fingerprint;
         let b = parse(&base(b"Home", 11, 9, 7)).fingerprint;
         assert_eq!(a, b, "channel, load, TIM and WMM counters must not change the fingerprint");
+        let probe_response = [
+            ie(0, b"Home"),
+            ie(1, &[0x82, 0x84, 0x8b, 0x96]),
+            ie(3, &[6]),
+            ie(11, &[3, 0, 10, 0, 0]),
+            ie(45, &[0xEF, 0x01, 0x17, 0xFF]),
+            rsn(&[2], 0),
+            ie(221, &[0x00, 0x50, 0xF2, 2, 1, 1, 3]),
+        ]
+        .concat();
+        assert_eq!(a, parse(&probe_response).fingerprint, "a beacon (with TIM) and a probe response (without)");
 
         // Different capabilities (e.g. a hostapd clone without HT caps) change it.
         let clone = [ie(0, b"Home"), ie(1, &[0x82, 0x84, 0x8b, 0x96]), ie(3, &[6]), rsn(&[2], 0)].concat();

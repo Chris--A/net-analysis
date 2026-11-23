@@ -4,12 +4,12 @@
 //! It models a home network (mesh router, LAN hosts), neighbouring APs, BLE
 //! devices that come and go, and an **evil twin** of the home SSID that appears
 //! after `evil_twin_after`. The twin has an open network, a locally-administered BSSID,
-//! a fresh TSF uptime and a minimal IE set. All vendor prefixes are synthetic.
+//! a fresh TSF uptime and a minimal IE set. A **Karma AP** (after `karma_ap_after`)
+//! rotates through several network names and answers the guard's decoy probes.
+//! All vendor prefixes are synthetic.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
-
-use std::sync::Arc;
 
 use na_model::{
     Akm, ApInfo, Band, Banner, BleAddressType, BtClassicInfo, Cipher, ClaimKind, DeviceDetails,
@@ -18,7 +18,8 @@ use na_model::{
 };
 
 use super::ble::{BleSighting, classic_observation, observation as ble_observation};
-use super::{BoxFuture, Source, SourceCtx};
+use super::{BoxFuture, Source, SourceCtx, SourceDeps};
+use crate::guard::GuardSignal;
 use crate::identify::{BtDb, OuiDb, lan_evidence};
 
 #[derive(Clone, Debug)]
@@ -29,6 +30,8 @@ pub struct SimConfig {
     pub extra_devices: usize,
     /// When the evil-twin AP appears (None disables it).
     pub evil_twin_after: Option<Duration>,
+    /// When the Karma AP appears (None disables it).
+    pub karma_ap_after: Option<Duration>,
 }
 
 impl Default for SimConfig {
@@ -38,18 +41,19 @@ impl Default for SimConfig {
             tick: Duration::from_secs(1),
             extra_devices: 0,
             evil_twin_after: Some(Duration::from_secs(20)),
+            karma_ap_after: Some(Duration::from_secs(5)),
         }
     }
 }
 
 pub struct SimSource {
     cfg: SimConfig,
-    bt: Arc<BtDb>,
+    deps: SourceDeps,
 }
 
 impl SimSource {
-    pub fn new(cfg: SimConfig, bt: Arc<BtDb>) -> Self {
-        Self { cfg, bt }
+    pub fn new(cfg: SimConfig, deps: SourceDeps) -> Self {
+        Self { cfg, deps }
     }
 }
 
@@ -60,18 +64,22 @@ impl Source for SimSource {
 
     fn run(self: Box<Self>, ctx: SourceCtx) -> BoxFuture<anyhow::Result<()>> {
         Box::pin(async move {
-            let mut world = SimWorld::new(&self.cfg, &self.bt);
+            let mut world = SimWorld::new(&self.cfg, &self.deps.bt);
             let start = tokio::time::Instant::now();
             let mut tick = tokio::time::interval(self.cfg.tick);
             loop {
-                tokio::select! {
+                let batch = tokio::select! {
                     _ = ctx.cancel.cancelled() => return Ok(()),
-                    _ = tick.tick() => {
-                        for obs in world.step(start.elapsed()) {
-                            if ctx.sink.send(obs).await.is_err() {
-                                return Ok(());
-                            }
-                        }
+                    _ = tick.tick() => world.step(start.elapsed()),
+                    Ok(req) = self.deps.karma.recv_async() => {
+                        let answers = world.karma_probe(&req.ssid);
+                        let _ = self.deps.guard.send(GuardSignal::KarmaSent { ssid: req.ssid, result: Ok(()) });
+                        answers
+                    }
+                };
+                for obs in batch {
+                    if ctx.sink.send(obs).await.is_err() {
+                        return Ok(());
                     }
                 }
             }
@@ -112,6 +120,10 @@ struct SimDevice {
     presence: Presence,
     /// AP uptime at sim start (may be negative for APs that boot later).
     tsf_offset_secs: Option<i64>,
+    /// Network names this AP rotates through (a MANA-style rogue AP).
+    ssid_cycle: Vec<&'static str>,
+    /// Answers directed probes for any name (Karma).
+    karma: bool,
 }
 
 impl SimDevice {
@@ -125,6 +137,8 @@ impl SimDevice {
             rssi: base_rssi.unwrap_or(0.0),
             presence: Presence::Always,
             tsf_offset_secs: None,
+            ssid_cycle: Vec::new(),
+            karma: false,
         }
     }
 
@@ -159,6 +173,8 @@ impl SimDevice {
 pub(crate) struct SimWorld {
     devices: Vec<SimDevice>,
     rng: Rng,
+    /// Seconds since start, as of the last step.
+    t: f32,
 }
 
 impl SimWorld {
@@ -169,13 +185,36 @@ impl SimWorld {
         build_neighbour_aps(&mut devices, &mut rng);
         build_ble(&mut devices, &mut rng, bt);
         build_bt_classic(&mut devices);
+        build_rogues(&mut devices, cfg);
         build_extra(&mut devices, &mut rng, cfg.extra_devices, bt);
-        Self { devices, rng }
+        Self { devices, rng, t: 0.0 }
+    }
+
+    /// Karma APs that are present answer a directed probe for any name.
+    pub(crate) fn karma_probe(&self, ssid: &str) -> Vec<Observation> {
+        self.devices
+            .iter()
+            .filter(|d| d.karma && d.presence.is_present(self.t))
+            .filter_map(|d| {
+                let DeviceDetails::Ap(ap) = &d.details else { return None };
+                let mut answer = ap.clone();
+                answer.ssid = ssid.to_owned();
+                Some(Observation {
+                    key: d.key.clone(),
+                    at: now_millis(),
+                    rssi: Some(d.rssi.round() as i16),
+                    details: DeviceDetails::Ap(answer),
+                    evidence: d.evidence.clone(),
+                    links: Vec::new(),
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn step(&mut self, elapsed: Duration) -> Vec<Observation> {
         let now = now_millis();
         let t = elapsed.as_secs_f32();
+        self.t = t;
         let rng = &mut self.rng;
         let mut out = Vec::with_capacity(self.devices.len());
         for d in &mut self.devices {
@@ -191,6 +230,9 @@ impl SimWorld {
             let mut details = d.details.clone();
             if let (DeviceDetails::Ap(ap), Some(off)) = (&mut details, d.tsf_offset_secs) {
                 ap.tsf_uptime_secs = Some((off + elapsed.as_secs() as i64).max(0) as u64);
+            }
+            if let (DeviceDetails::Ap(ap), false) = (&mut details, d.ssid_cycle.is_empty()) {
+                ap.ssid = d.ssid_cycle[(elapsed.as_secs() / 4) as usize % d.ssid_cycle.len()].to_owned();
             }
             out.push(Observation {
                 key: d.key.clone(),
@@ -802,6 +844,22 @@ fn static_ble_address(rng: &mut Rng) -> MacAddr {
     MacAddr([b[0] | 0xC0, b[1], b[2], b[3], b[4], b[5]])
 }
 
+/// A MANA-style rogue AP: open, locally-administered BSSID, cycling through
+/// common public network names, and answering probes for any name.
+fn build_rogues(out: &mut Vec<SimDevice>, cfg: &SimConfig) {
+    let Some(after) = cfg.karma_ap_after else { return };
+    let s = after.as_secs_f32();
+    let mut bssid = sim_mac("rogue-radio", 0x13_3700);
+    bssid.0[0] |= 0x02;
+    let mut d = ap("Airport Free WiFi", bssid, Band::G2_4, 11, 20, open(), 4, -58.0, stable_hash(b"hostapd-mana"))
+        .presence(Presence::After(s))
+        .tsf(-(s as i64))
+        .ev(Src::Ie, ClaimKind::DeviceType, "Wi-Fi AP", 0.3, "Minimal IE set: no WPS, no vendor IEs (hostapd-like)");
+    d.ssid_cycle = vec!["Airport Free WiFi", "Hotel Guest", "CoffeeShop"];
+    d.karma = true;
+    out.push(d);
+}
+
 fn build_extra(out: &mut Vec<SimDevice>, rng: &mut Rng, count: usize, bt: &BtDb) {
     let oui = OuiDb::default();
     for i in 0..count {
@@ -899,6 +957,28 @@ mod tests {
         assert!(twin.bssid.is_locally_administered());
         assert_eq!(twin.tsf_uptime_secs, Some(5));
         assert!(twin.wps.is_none());
+    }
+
+    #[test]
+    fn karma_ap_cycles_names_and_answers_probes() {
+        let cfg = SimConfig { karma_ap_after: Some(Duration::from_secs(5)), ..Default::default() };
+        let mut w = SimWorld::new(&cfg, &BtDb::builtin());
+        let rogue_ssids = |obs: &[Observation]| {
+            obs.iter()
+                .filter_map(|o| match &o.details {
+                    DeviceDetails::Ap(a) if a.bssid.is_locally_administered() && a.channel == 11 => Some(a.ssid.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(rogue_ssids(&w.step(Duration::from_secs(1))).is_empty(), "not there yet");
+        assert!(w.karma_probe("Lounge-123456").is_empty(), "absent APs don't answer");
+        let names: std::collections::HashSet<String> =
+            (6..18).flat_map(|s| rogue_ssids(&w.step(Duration::from_secs(s)))).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        let answers = w.karma_probe("Lounge-123456");
+        assert_eq!(answers.len(), 1);
+        assert!(matches!(&answers[0].details, DeviceDetails::Ap(a) if a.ssid == "Lounge-123456"));
     }
 
     #[test]

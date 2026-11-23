@@ -4,15 +4,22 @@ use na_engine::BtDb;
 use na_engine::identify::ble::{cod_services, describe_manufacturer, uuid_label};
 use na_engine::identify::{VendorIeKind, appearance_label, class_of_device_label, vendor_ie_info};
 use na_engine::parse::{ble_ad, ie};
-use na_model::{ApInfo, BleInfo, BtClassicInfo, ClaimKind, Device, LanInfo, now_millis};
+use na_model::{ApInfo, BleInfo, BtClassicInfo, ClaimKind, Device, EngineCommand, LanInfo, now_millis};
 
-use super::theme::{ACCENT, DANGER, WARN, WEAK};
-use super::{ago, color32, duration_text};
-use crate::bridge::Registry;
+use super::theme::{ACCENT, DANGER, OK, WARN, WEAK};
+use super::{UiState, ago, color32, duration_text};
+use crate::bridge::{EngineLink, Registry};
 use crate::picking::Selection;
 use crate::scene::kind_color;
 
-pub fn show(root: &mut egui::Ui, reg: &Registry, sel: &mut Selection, bt: &BtDb) {
+pub fn show(
+    root: &mut egui::Ui,
+    reg: &Registry,
+    sel: &mut Selection,
+    ui_state: &mut UiState,
+    link: Option<&EngineLink>,
+    bt: &BtDb,
+) {
     egui::Panel::right("inspector")
         .resizable(true)
         .default_size(340.0)
@@ -28,11 +35,19 @@ pub fn show(root: &mut egui::Ui, reg: &Registry, sel: &mut Selection, bt: &BtDb)
             egui::ScrollArea::vertical()
                 .id_salt("inspector")
                 .auto_shrink(false)
-                .show(ui, |ui| device(ui, d, reg, sel, bt));
+                .show(ui, |ui| device(ui, d, reg, sel, ui_state, link, bt));
         });
 }
 
-fn device(ui: &mut egui::Ui, d: &Device, reg: &Registry, sel: &mut Selection, bt: &BtDb) {
+fn device(
+    ui: &mut egui::Ui,
+    d: &Device,
+    reg: &Registry,
+    sel: &mut Selection,
+    ui_state: &mut UiState,
+    link: Option<&EngineLink>,
+    bt: &BtDb,
+) {
     let now = now_millis();
     ui.horizontal(|ui| {
         ui.heading(RichText::new(d.display_name()).color(color32(kind_color(d.kind))));
@@ -55,6 +70,9 @@ fn device(ui: &mut egui::Ui, d: &Device, reg: &Registry, sel: &mut Selection, bt
     );
     if d.risk > 0.05 {
         ui.label(RichText::new(format!("⚠ Risk score {:.0}%", d.risk * 100.0)).strong().color(DANGER));
+        if d.ap().is_none() {
+            reasons(ui, d);
+        }
     }
 
     if !d.rssi_history.is_empty() {
@@ -99,7 +117,10 @@ fn device(ui: &mut egui::Ui, d: &Device, reg: &Registry, sel: &mut Selection, bt
     }
 
     match &d.details {
-        na_model::DeviceDetails::Ap(ap) => ap_details(ui, ap),
+        na_model::DeviceDetails::Ap(ap) => {
+            guard_section(ui, d, ap, reg, ui_state, link);
+            ap_details(ui, ap);
+        }
         na_model::DeviceDetails::Ble(b) => ble_details(ui, b, bt),
         na_model::DeviceDetails::BtClassic(c) => classic_details(ui, c),
         na_model::DeviceDetails::Lan(l) => lan_details(ui, l),
@@ -136,6 +157,139 @@ fn device(ui: &mut egui::Ui, d: &Device, reg: &Registry, sel: &mut Selection, bt
                 sel.selected = Some(l.id);
             }
         }
+    }
+}
+
+fn reasons(ui: &mut egui::Ui, d: &Device) {
+    let color = if d.risk > 0.0 { DANGER } else { WEAK };
+    for r in &d.risk_reasons {
+        ui.label(RichText::new(format!("• {r}")).size(12.0).color(color));
+    }
+}
+
+/// Trust status of this AP's network, the guard's findings, and the trust controls.
+fn guard_section(
+    ui: &mut egui::Ui,
+    d: &Device,
+    ap: &ApInfo,
+    reg: &Registry,
+    ui_state: &mut UiState,
+    link: Option<&EngineLink>,
+) {
+    section(ui, "Guard");
+    if ap.ssid.is_empty() {
+        ui.label(RichText::new("Hidden network: no name to check against your trusted networks.").color(WEAK));
+        reasons(ui, d);
+        return;
+    }
+    let now = now_millis();
+    let net = reg.guard.as_ref().and_then(|g| g.network(&ap.ssid));
+    let known = net.and_then(|n| n.find(ap.bssid));
+    egui::Grid::new("guard").num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+        match net {
+            Some(n) => {
+                let sources: Vec<&str> = n.sources.iter().map(|s| s.label()).collect();
+                kv(ui, "Network", RichText::new(format!("trusted ({})", sources.join(", "))).color(OK));
+                if let Some(e) = &n.expected {
+                    kv(ui, "Expected security", format!("{} (profile: {})", e.class.label(), e.auth));
+                }
+                kv(ui, "Known access points", n.known.len().to_string());
+                let this = match known {
+                    Some(k) => RichText::new(format!("known ({}, since {})", k.source.label(), ago(now, k.first_seen))).color(OK),
+                    None if n.known.is_empty() => RichText::new("no access points learned yet").color(WEAK),
+                    None => RichText::new("not one of the known access points").color(WARN),
+                };
+                kv(ui, "This access point", this);
+            }
+            None => kv(ui, "Network", RichText::new("not a trusted network").color(WEAK)),
+        }
+    });
+    if d.risk_reasons.is_empty() {
+        if d.risk == 0.0 && known.is_some() {
+            ui.label(RichText::new("Matches its network's baseline.").color(OK));
+        }
+    } else {
+        ui.add_space(2.0);
+        reasons(ui, d);
+    }
+
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        let send = |cmd| {
+            if let Some(link) = link {
+                link.send(cmd);
+            }
+        };
+        if known.is_none() {
+            let flagged = d.risk >= 0.3;
+            let label = RichText::new(if flagged { "Trust anyway…" } else { "Trust this access point" })
+                .color(if flagged { DANGER } else { ACCENT });
+            let tip = "Remember this BSSID as a legitimate access point of its network.";
+            if ui.button(label).on_hover_text(tip).clicked() {
+                if flagged {
+                    ui_state.confirm_trust = Some((ap.bssid, ap.ssid.clone()));
+                } else {
+                    send(EngineCommand::TrustAccessPoint { bssid: ap.bssid });
+                }
+            }
+        }
+        // Only offered when it would learn something: a visible, unflagged AP with this name.
+        let clean_peer = reg.devices.values().any(|o| o.risk < 0.3 && o.ap().is_some_and(|a| a.ssid == ap.ssid));
+        if net.is_none_or(|n| n.known.is_empty()) && clean_peer {
+            let tip = "Remember every access point currently broadcasting this name, except any with warnings.";
+            if ui.button(format!("Trust \"{}\"", ap.ssid)).on_hover_text(tip).clicked() {
+                send(EngineCommand::TrustNetwork { ssid: ap.ssid.clone() });
+            }
+        }
+        if net.is_some_and(|n| !n.known.is_empty()) {
+            let tip = "Forget the learned access points. A saved Wi-Fi profile keeps its expected security.";
+            if ui.button("Forget learned APs").on_hover_text(tip).clicked() {
+                send(EngineCommand::ForgetNetwork { ssid: ap.ssid.clone() });
+            }
+        }
+    });
+}
+
+/// Trusting a flagged AP silences the guard for it, so ask first.
+pub fn confirm_trust(ctx: &egui::Context, ui_state: &mut UiState, reg: &Registry, link: Option<&EngineLink>) {
+    let Some((bssid, ssid)) = ui_state.confirm_trust.clone() else { return };
+    let reasons: Vec<String> = reg
+        .devices
+        .values()
+        .find(|d| d.ap().is_some_and(|a| a.bssid == bssid))
+        .map(|d| d.risk_reasons.clone())
+        .unwrap_or_default();
+    let modal = egui::Modal::new(egui::Id::new("confirm_trust_ap")).show(ctx, |ui| {
+        ui.set_max_width(460.0);
+        ui.heading("Trust a flagged access point?");
+        ui.add_space(6.0);
+        ui.label(format!(
+            "{bssid} will be remembered as a legitimate access point of \"{ssid}\", and the guard will stop \
+             warning about it. It was flagged because:"
+        ));
+        for r in &reasons {
+            ui.label(RichText::new(format!("• {r}")).size(12.0).color(WARN));
+        }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Only do this if you know this access point, e.g. a new router or extender you set up.")
+                .color(WARN),
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button(RichText::new("Trust it").color(DANGER)).clicked() {
+                if let Some(link) = link {
+                    link.send(EngineCommand::TrustAccessPoint { bssid });
+                }
+                ui_state.confirm_trust = None;
+            }
+            if ui.button("Cancel").clicked() {
+                ui_state.confirm_trust = None;
+            }
+        });
+    });
+    if modal.should_close() {
+        ui_state.confirm_trust = None;
     }
 }
 
