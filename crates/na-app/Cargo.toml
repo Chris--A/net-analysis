@@ -1,0 +1,18 @@
+[package]
+name = "na-app"
+description = "3D desktop frontend (Bevy + egui)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "net-analysis"
+path = "src/main.rs"
+
+[dependencies]
+na-model.workspace = true
+na-engine.workspace = true
+bevy.workspace = true
+bevy_egui.workspace = true
+bevy_panorbit_camera.workspace = true
+egui_plot.workspace = true
