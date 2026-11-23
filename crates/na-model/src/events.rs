@@ -36,7 +36,7 @@ impl SourceKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Wifi => "Wi-Fi",
-            Self::Ble => "BLE",
+            Self::Ble => "Bluetooth",
             Self::Lan => "LAN",
             Self::Capture => "Capture",
             Self::Sim => "Sim",

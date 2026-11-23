@@ -71,6 +71,15 @@ impl DeviceStore {
             (_, DeviceDetails::None) => {}
             // LAN facts arrive piecemeal from many protocols, so union them.
             (DeviceDetails::Lan(cur), DeviceDetails::Lan(new)) => cur.merge(&new),
+            // Beacons usually omit the WPS make/model that probe responses carry,
+            // so keep the last known WPS info rather than flapping.
+            (DeviceDetails::Ap(cur), DeviceDetails::Ap(new)) => {
+                let prev_wps = cur.wps.take();
+                *cur = new;
+                if cur.wps.is_none() {
+                    cur.wps = prev_wps;
+                }
+            }
             // Radio sources report the full current state each time.
             (slot, new) => *slot = new,
         }
@@ -138,7 +147,8 @@ impl DeviceStore {
 impl StalePolicy {
     fn timeout_ms(&self, kind: DeviceKind) -> Millis {
         let d = match kind {
-            DeviceKind::Ble | DeviceKind::BtClassic => self.bluetooth,
+            DeviceKind::Ble => self.bluetooth,
+            DeviceKind::BtClassic => self.bt_classic,
             DeviceKind::AccessPoint | DeviceKind::WifiClient => self.wifi,
             DeviceKind::LanHost => self.lan,
         };
@@ -172,6 +182,7 @@ mod tests {
     fn store() -> DeviceStore {
         DeviceStore::new(StalePolicy {
             bluetooth: Duration::from_secs(10),
+            bt_classic: Duration::from_secs(50),
             wifi: Duration::from_secs(20),
             lan: Duration::from_secs(100),
         })

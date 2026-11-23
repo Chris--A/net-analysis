@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/na-model",
+    "crates/na-platform",
     "crates/na-engine",
     "crates/na-cli",
     "crates/na-app",
@@ -14,6 +15,7 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 na-model = { path = "crates/na-model" }
+na-platform = { path = "crates/na-platform" }
 na-engine = { path = "crates/na-engine" }
 
 serde = { version = "1", features = ["derive"] }

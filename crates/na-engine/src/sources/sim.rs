@@ -9,14 +9,17 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use na_model::{
-    Akm, ApInfo, Band, BleInfo, Cipher, ClaimKind, DeviceDetails, DeviceKey, Evidence,
-    EvidenceSource as Src, LanInfo, MacAddr, Observation, Pmf, Security, SourceKind, WpsInfo,
-    now_millis, stable_hash,
-};
-use tokio_util::sync::CancellationToken;
+use std::sync::Arc;
 
-use super::{BoxFuture, ObservationSink, Source};
+use na_model::{
+    Akm, ApInfo, Band, BleAddressType, BtClassicInfo, Cipher, ClaimKind, DeviceDetails, DeviceKey,
+    Evidence, EvidenceSource as Src, LanInfo, MacAddr, Observation, Pmf, Security, SourceKind,
+    WpsInfo, now_millis, stable_hash,
+};
+
+use super::ble::{BleSighting, classic_observation, observation as ble_observation};
+use super::{BoxFuture, Source, SourceCtx};
+use crate::identify::{BtDb, OuiDb};
 
 #[derive(Clone, Debug)]
 pub struct SimConfig {
@@ -41,11 +44,12 @@ impl Default for SimConfig {
 
 pub struct SimSource {
     cfg: SimConfig,
+    bt: Arc<BtDb>,
 }
 
 impl SimSource {
-    pub fn new(cfg: SimConfig) -> Self {
-        Self { cfg }
+    pub fn new(cfg: SimConfig, bt: Arc<BtDb>) -> Self {
+        Self { cfg, bt }
     }
 }
 
@@ -54,21 +58,17 @@ impl Source for SimSource {
         SourceKind::Sim
     }
 
-    fn run(
-        self: Box<Self>,
-        sink: ObservationSink,
-        cancel: CancellationToken,
-    ) -> BoxFuture<anyhow::Result<()>> {
+    fn run(self: Box<Self>, ctx: SourceCtx) -> BoxFuture<anyhow::Result<()>> {
         Box::pin(async move {
-            let mut world = SimWorld::new(&self.cfg);
+            let mut world = SimWorld::new(&self.cfg, &self.bt);
             let start = tokio::time::Instant::now();
             let mut tick = tokio::time::interval(self.cfg.tick);
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => return Ok(()),
+                    _ = ctx.cancel.cancelled() => return Ok(()),
                     _ = tick.tick() => {
                         for obs in world.step(start.elapsed()) {
-                            if sink.send(obs).await.is_err() {
+                            if ctx.sink.send(obs).await.is_err() {
                                 return Ok(());
                             }
                         }
@@ -162,13 +162,14 @@ pub(crate) struct SimWorld {
 }
 
 impl SimWorld {
-    pub(crate) fn new(cfg: &SimConfig) -> Self {
+    pub(crate) fn new(cfg: &SimConfig, bt: &BtDb) -> Self {
         let mut rng = Rng(cfg.seed);
         let mut devices = Vec::new();
         build_home(&mut devices, cfg);
         build_neighbour_aps(&mut devices, &mut rng);
-        build_ble(&mut devices, &mut rng);
-        build_extra(&mut devices, &mut rng, cfg.extra_devices);
+        build_ble(&mut devices, &mut rng, bt);
+        build_bt_classic(&mut devices);
+        build_extra(&mut devices, &mut rng, cfg.extra_devices, bt);
         Self { devices, rng }
     }
 
@@ -219,7 +220,7 @@ fn sim_mac(vendor: &str, n: u32) -> MacAddr {
 
 fn oui_detail(mac: MacAddr, vendor: &str) -> String {
     let o = mac.oui();
-    format!("OUI {:02X}:{:02X}:{:02X} → {vendor} (synthetic)", o[0], o[1], o[2])
+    format!("OUI {:02X}:{:02X}:{:02X} = {vendor} (synthetic)", o[0], o[1], o[2])
 }
 
 fn sec(akms: &[Akm], pmf: Pmf) -> Security {
@@ -276,6 +277,11 @@ fn ap(
         wps: None,
         ie_fingerprint,
         connected: false,
+        station_count: None,
+        channel_utilization: None,
+        country: None,
+        vendor_ies: Vec::new(),
+        raw_ies: Vec::new(),
     };
     SimDevice::new(DeviceKey::Bssid(bssid), DeviceDetails::Ap(info), Some(rssi))
 }
@@ -503,87 +509,159 @@ fn build_neighbour_aps(out: &mut Vec<SimDevice>, rng: &mut Rng) {
     }
 }
 
+/// One synthetic BLE device, described by what it actually advertises. It is decoded
+/// by the same code as real adverts, so the sim exercises the identification rules.
 struct BleSpec {
     name: Option<&'static str>,
-    company: Option<u16>,
-    mfr: &'static [u8],
-    services: &'static [&'static str],
+    /// (company ID, data after the company ID)
+    mfr: Option<(u16, &'static [u8])>,
+    services: &'static [u16],
+    /// (16-bit UUID, data)
+    service_data: Option<(u16, &'static [u8])>,
+    appearance: Option<u16>,
+    tx_power: Option<i8>,
+    /// Random static instead of a rotating private address (accessories, tags).
+    static_addr: bool,
+    /// Paired and connected to this host (no adverts: the OS supplies name/appearance).
+    connected: bool,
     rssi: f32,
     /// (period seconds, fraction present). None = always present.
     cycle: Option<(f32, f32)>,
-    vendor: Option<&'static str>,
-    dtype: Option<&'static str>,
-    model: Option<&'static str>,
-    os: Option<&'static str>,
-    detail: &'static str,
 }
 
 const BLE_DEFAULT: BleSpec = BleSpec {
     name: None,
-    company: None,
-    mfr: &[],
+    mfr: None,
     services: &[],
+    service_data: None,
+    appearance: None,
+    tx_power: None,
+    static_addr: false,
+    connected: false,
     rssi: -80.0,
     cycle: None,
-    vendor: None,
-    dtype: None,
-    model: None,
-    os: None,
-    detail: "",
 };
 
-fn build_ble(out: &mut Vec<SimDevice>, rng: &mut Rng) {
+/// Apple Find My "separated" payload: 25 bytes after the type/length header.
+const FIND_MY: &[u8] = &[
+    0x12, 0x19, 0x10, 0x5C, 0x2B, 0x71, 0xA0, 0x93, 0x4E, 0x11, 0xD2, 0x05, 0x6B, 0x3A, 0xF7, 0x88,
+    0x14, 0xC9, 0x02, 0x67, 0xEE, 0x31, 0x9D, 0x40, 0xAB, 0x00, 0x01,
+];
+/// AirPods Pro Proximity Pairing (model 0x0E20).
+const AIRPODS_PRO: &[u8] = &[
+    0x07, 0x19, 0x01, 0x0E, 0x20, 0x2B, 0x99, 0x8F, 0x01, 0x00, 0x05, 0x6A, 0x1D, 0x42, 0x90, 0x33,
+    0xC1, 0x7E, 0x08, 0x5F, 0x21, 0xD4, 0xA2, 0x6C, 0x10, 0x3B, 0x77,
+];
+/// iPhone: Nearby Info followed by Handoff.
+const IPHONE: &[u8] = &[
+    0x10, 0x05, 0x01, 0x18, 0x6E, 0x2A, 0x0B, 0x0C, 0x0E, 0x00, 0x51, 0x7D, 0x93, 0x02, 0xFE, 0x11,
+    0x4A, 0x6C, 0x2D, 0xB0, 0x07,
+];
+
+fn build_ble(out: &mut Vec<SimDevice>, rng: &mut Rng, bt: &BtDb) {
     let specs = [
-        BleSpec { company: Some(0x004C), mfr: &[0x10, 0x05, 0x01, 0x18, 0x6E, 0x2A, 0x0B], rssi: -58.0, vendor: Some("Apple"), dtype: Some("Phone"), os: Some("iOS"), detail: "Apple Continuity 0x10 (Nearby Info)", ..BLE_DEFAULT },
-        BleSpec { company: Some(0x004C), mfr: &[0x07, 0x19, 0x01, 0x0E, 0x20, 0x55, 0xAA], rssi: -62.0, vendor: Some("Apple"), dtype: Some("Headphones"), model: Some("AirPods Pro"), detail: "Apple Continuity 0x07 (Proximity Pairing), model 0x200E", ..BLE_DEFAULT },
-        BleSpec { company: Some(0x004C), mfr: &[0x12, 0x19, 0x10], rssi: -84.0, vendor: Some("Apple"), dtype: Some("Tracker"), model: Some("Find My accessory"), detail: "Apple Continuity 0x12 (Offline Finding)", ..BLE_DEFAULT },
-        BleSpec { company: Some(0x0075), mfr: &[0x42, 0x09, 0x81, 0x02], rssi: -71.0, cycle: Some((90.0, 0.7)), vendor: Some("Samsung"), dtype: Some("Phone"), os: Some("Android"), detail: "Company ID 0x0075 (Samsung)", ..BLE_DEFAULT },
-        BleSpec { name: Some("Galaxy Buds2 (4F2A)"), company: Some(0x0075), rssi: -74.0, vendor: Some("Samsung"), dtype: Some("Headphones"), model: Some("Galaxy Buds2"), detail: "Local name + company ID 0x0075", ..BLE_DEFAULT },
-        BleSpec { services: &["0xFE2C"], rssi: -77.0, cycle: Some((60.0, 0.5)), vendor: Some("Google"), dtype: Some("Headphones"), model: Some("Pixel Buds Pro"), detail: "Google Fast Pair service 0xFE2C", ..BLE_DEFAULT },
-        BleSpec { name: Some("Tile"), services: &["0xFEED"], rssi: -85.0, vendor: Some("Tile"), dtype: Some("Tracker"), detail: "Service 0xFEED (Tile)", ..BLE_DEFAULT },
-        BleSpec { name: Some("Bose QC45"), company: Some(0x009E), rssi: -79.0, cycle: Some((120.0, 0.6)), vendor: Some("Bose"), dtype: Some("Headphones"), model: Some("QuietComfort 45"), detail: "Company ID 0x009E (Bose)", ..BLE_DEFAULT },
-        BleSpec { name: Some("WH-1000XM5"), company: Some(0x012D), rssi: -88.0, cycle: Some((45.0, 0.35)), vendor: Some("Sony"), dtype: Some("Headphones"), model: Some("WH-1000XM5"), detail: "Company ID 0x012D (Sony)", ..BLE_DEFAULT },
-        BleSpec { name: Some("Xbox Wireless Controller"), company: Some(0x0006), rssi: -66.0, vendor: Some("Microsoft"), dtype: Some("Game controller"), detail: "Local name + company ID 0x0006", ..BLE_DEFAULT },
-        BleSpec { company: Some(0x0006), mfr: &[0x01, 0x09, 0x20, 0x02], rssi: -55.0, vendor: Some("Microsoft"), dtype: Some("Windows PC"), os: Some("Windows"), detail: "Microsoft CDP beacon (company 0x0006, scenario 0x01)", ..BLE_DEFAULT },
-        BleSpec { name: Some("[LG] webOS TV OLED55C2"), company: Some(0x00C4), rssi: -70.0, vendor: Some("LG Electronics"), dtype: Some("TV"), model: Some("OLED55C2"), os: Some("webOS"), detail: "Local name + company ID 0x00C4", ..BLE_DEFAULT },
-        BleSpec { name: Some("Hue color lamp"), services: &["0xFE0F"], rssi: -68.0, vendor: Some("Signify"), dtype: Some("Smart bulb"), detail: "Service 0xFE0F (Signify / Philips Hue)", ..BLE_DEFAULT },
-        BleSpec { name: Some("GVH5075_8F2B"), rssi: -81.0, vendor: Some("Govee"), dtype: Some("Thermometer"), model: Some("H5075"), detail: "Local name pattern GVH5075_*", ..BLE_DEFAULT },
-        BleSpec { name: Some("Mi Smart Band 6"), services: &["0xFE95"], rssi: -76.0, cycle: Some((70.0, 0.5)), vendor: Some("Xiaomi"), dtype: Some("Wearable"), model: Some("Mi Smart Band 6"), detail: "Service 0xFE95 (Xiaomi MiBeacon)", ..BLE_DEFAULT },
-        BleSpec { name: Some("Forerunner 255"), company: Some(0x0087), rssi: -83.0, cycle: Some((100.0, 0.4)), vendor: Some("Garmin"), dtype: Some("Wearable"), model: Some("Forerunner 255"), detail: "Company ID 0x0087 (Garmin)", ..BLE_DEFAULT },
-        BleSpec { name: Some("S7b3c1a9f2e4d5c6aC"), rssi: -90.0, cycle: Some((150.0, 0.3)), vendor: Some("Tesla"), dtype: Some("Vehicle"), detail: "Local name matches Tesla phone-key beacon pattern", ..BLE_DEFAULT },
+        BleSpec { mfr: Some((0x004C, IPHONE)), tx_power: Some(12), rssi: -58.0, ..BLE_DEFAULT },
+        BleSpec { mfr: Some((0x004C, AIRPODS_PRO)), rssi: -62.0, ..BLE_DEFAULT },
+        BleSpec { mfr: Some((0x004C, FIND_MY)), static_addr: true, rssi: -84.0, ..BLE_DEFAULT },
+        // Samsung phone: Samsung data plus the Google Play services beacon.
+        BleSpec {
+            mfr: Some((0x0075, &[0x42, 0x09, 0x81, 0x02, 0x14, 0x15, 0x03, 0x21])),
+            service_data: Some((0xFCF1, &[0x04, 0x67, 0x53, 0x23, 0xCD, 0xC9])),
+            rssi: -71.0,
+            cycle: Some((90.0, 0.7)),
+            ..BLE_DEFAULT
+        },
+        BleSpec { name: Some("Galaxy Buds2 (4F2A)"), mfr: Some((0x0075, &[0x42, 0x09, 0x81, 0x02])), rssi: -74.0, ..BLE_DEFAULT },
+        BleSpec { name: Some("Pixel Buds Pro"), service_data: Some((0xFE2C, &[0x71, 0x7F, 0x41])), rssi: -77.0, cycle: Some((60.0, 0.5)), ..BLE_DEFAULT },
+        BleSpec {
+            name: Some("Tile"),
+            services: &[0xFEED],
+            service_data: Some((0xFEED, &[0x02, 0x00, 0xCE, 0xF5, 0x4F, 0xA0, 0xA7, 0xA6])),
+            static_addr: true,
+            rssi: -85.0,
+            ..BLE_DEFAULT
+        },
+        BleSpec { name: Some("LE-Bose QC45"), mfr: Some((0x009E, &[0x01, 0x07])), appearance: Some(0x0943), rssi: -79.0, cycle: Some((120.0, 0.6)), ..BLE_DEFAULT },
+        BleSpec { name: Some("LE_WH-1000XM5"), mfr: Some((0x012D, &[0x04, 0x00, 0x01])), rssi: -88.0, cycle: Some((45.0, 0.35)), ..BLE_DEFAULT },
+        BleSpec { name: Some("Xbox Wireless Controller"), mfr: Some((0x0006, &[0x00, 0x00])), appearance: Some(0x03C4), static_addr: true, rssi: -66.0, ..BLE_DEFAULT },
+        // Windows desktop: Microsoft CDP beacon, device type 9.
+        BleSpec { mfr: Some((0x0006, &[0x01, 0x09, 0x20, 0x02, 0x9A, 0x3C, 0x51, 0xE0])), rssi: -55.0, ..BLE_DEFAULT },
+        BleSpec { name: Some("[LG] webOS TV OLED55C2"), mfr: Some((0x00C4, &[0x02, 0x01])), rssi: -70.0, ..BLE_DEFAULT },
+        BleSpec { name: Some("Hue color lamp"), services: &[0xFE0F], static_addr: true, rssi: -68.0, ..BLE_DEFAULT },
+        BleSpec { name: Some("GVH5075_8F2B"), mfr: Some((0xEC88, &[0x00, 0x03, 0x6B, 0x2A, 0x5D, 0x00])), static_addr: true, rssi: -81.0, ..BLE_DEFAULT },
+        BleSpec { name: Some("Mi Smart Band 6"), service_data: Some((0xFE95, &[0x30, 0x58, 0x52, 0x2A])), rssi: -76.0, cycle: Some((70.0, 0.5)), ..BLE_DEFAULT },
+        BleSpec { name: Some("Forerunner 255"), mfr: Some((0x0087, &[0x01, 0x00])), rssi: -83.0, cycle: Some((100.0, 0.4)), ..BLE_DEFAULT },
+        BleSpec { name: Some("Polar H10 8A2B3C"), services: &[0x180D], static_addr: true, rssi: -87.0, cycle: Some((110.0, 0.5)), ..BLE_DEFAULT },
+        BleSpec { name: Some("S7b3c1a9f2e4d5c6aC"), rssi: -90.0, cycle: Some((150.0, 0.3)), ..BLE_DEFAULT },
+        BleSpec { name: Some("Dell Mouse MS5120W"), appearance: Some(0x03C2), static_addr: true, connected: true, ..BLE_DEFAULT },
         BleSpec { rssi: -86.0, cycle: Some((40.0, 0.5)), ..BLE_DEFAULT },
         BleSpec { rssi: -91.0, cycle: Some((55.0, 0.4)), ..BLE_DEFAULT },
-        BleSpec { company: Some(0x004C), mfr: &[0x10, 0x05, 0x0B], rssi: -89.0, cycle: Some((35.0, 0.45)), vendor: Some("Apple"), detail: "Apple Continuity 0x10 (Nearby Info)", ..BLE_DEFAULT },
+        BleSpec { mfr: Some((0x004C, &[0x10, 0x05, 0x0B, 0x1C, 0x3D, 0x9A, 0x40])), rssi: -89.0, cycle: Some((35.0, 0.45)), ..BLE_DEFAULT },
         BleSpec { rssi: -94.0, cycle: Some((80.0, 0.3)), ..BLE_DEFAULT },
     ];
 
+    let oui = OuiDb::default();
     for spec in specs {
-        let address = random_ble_address(rng);
-        let info = BleInfo {
+        let address = if spec.static_addr { static_ble_address(rng) } else { random_ble_address(rng) };
+        let advertised = |v: Option<u16>| v.filter(|_| !spec.connected);
+        let mut sections: Vec<(u8, Vec<u8>)> = Vec::new();
+        if !spec.connected {
+            sections.push((0x01, vec![0x1A]));
+        }
+        if !spec.services.is_empty() {
+            sections.push((0x03, spec.services.iter().flat_map(|u| u.to_le_bytes()).collect()));
+        }
+        if let Some((uuid, data)) = spec.service_data {
+            sections.push((0x16, uuid.to_le_bytes().iter().chain(data).copied().collect()));
+        }
+        if let Some((company, data)) = spec.mfr {
+            sections.push((0xFF, company.to_le_bytes().iter().chain(data).copied().collect()));
+        }
+        if let Some(a) = advertised(spec.appearance) {
+            sections.push((0x19, a.to_le_bytes().to_vec()));
+        }
+        if let (Some(n), false) = (spec.name, spec.connected) {
+            sections.push((0x09, n.as_bytes().to_vec()));
+        }
+        let sighting = BleSighting {
             address,
-            random_address: true,
-            local_name: spec.name.map(Into::into),
-            company_id: spec.company,
-            manufacturer_data: spec.mfr.to_vec(),
-            service_uuids: spec.services.iter().map(|s| (*s).to_owned()).collect(),
-            tx_power: None,
-            appearance: None,
+            address_type: BleAddressType::from_random(address),
+            sections,
+            rssi: None,
+            tx_power: spec.tx_power,
             connectable: spec.name.is_some(),
+            paired: spec.connected,
+            connected: spec.connected,
+            os_name: spec.name.filter(|_| spec.connected).map(Into::into),
+            os_appearance: spec.appearance.filter(|_| spec.connected),
         };
-        let mut d = SimDevice::new(DeviceKey::Ble(address), DeviceDetails::Ble(info), Some(spec.rssi));
+        let obs = ble_observation(&sighting, 0, bt, &oui);
+        // Connected devices don't advertise, so they have no RSSI.
+        let base_rssi = (!spec.connected).then_some(spec.rssi);
+        let mut d = SimDevice::new(obs.key, obs.details, base_rssi);
+        d.evidence = obs.evidence;
         if let Some((period, on)) = spec.cycle {
             d = d.presence(Presence::Cycle { period, on, phase: rng.f32() });
         }
-        for (kind, value, conf) in [
-            (ClaimKind::Vendor, spec.vendor, 0.7),
-            (ClaimKind::DeviceType, spec.dtype, 0.6),
-            (ClaimKind::Model, spec.model, 0.7),
-            (ClaimKind::Os, spec.os, 0.5),
-        ] {
-            if let Some(v) = value {
-                d = d.ev(Src::BleAdv, kind, v, conf, spec.detail);
-            }
-        }
+        out.push(d);
+    }
+}
+
+fn build_bt_classic(out: &mut Vec<SimDevice>) {
+    let oui = OuiDb::default();
+    let devices = [
+        // Paired headphones, connected.
+        (sim_mac("Samsung", 0x00_1234), "Galaxy Buds Pro (1234)", 0x24_0404, true, true, false, Presence::Always),
+        // A neighbour's laptop with its Bluetooth settings open (discoverable).
+        (sim_mac("Intel", 0x8F_F072), "LAPTOP-CIGDPDU1", 0x2E_410C, false, false, true, Presence::Cycle { period: 200.0, on: 0.6, phase: 0.1 }),
+        (sim_mac("JBL", 0x00_4411), "JBL Flip 6", 0x24_0414, false, false, true, Presence::Cycle { period: 240.0, on: 0.5, phase: 0.6 }),
+    ];
+    for (address, name, cod, paired, connected, discoverable, presence) in devices {
+        let info = BtClassicInfo { address, name: Some(name.into()), class_of_device: cod, paired, connected, discoverable };
+        let obs = classic_observation(info, 0, &oui);
+        let mut d = SimDevice::new(obs.key, obs.details, None).presence(presence);
+        d.evidence = obs.evidence;
+        d.links = obs.links;
         out.push(d);
     }
 }
@@ -594,17 +672,30 @@ fn random_ble_address(rng: &mut Rng) -> MacAddr {
     MacAddr([(b[0] & 0x3F) | 0x40, b[1], b[2], b[3], b[4], b[5]])
 }
 
-fn build_extra(out: &mut Vec<SimDevice>, rng: &mut Rng, count: usize) {
+fn static_ble_address(rng: &mut Rng) -> MacAddr {
+    let b = rng.next_u64().to_be_bytes();
+    // Random static address: top two bits 11.
+    MacAddr([b[0] | 0xC0, b[1], b[2], b[3], b[4], b[5]])
+}
+
+fn build_extra(out: &mut Vec<SimDevice>, rng: &mut Rng, count: usize, bt: &BtDb) {
+    let oui = OuiDb::default();
     for i in 0..count {
         match i % 10 {
             0..=6 => {
                 let address = random_ble_address(rng);
-                let info = BleInfo { address, random_address: true, ..Default::default() };
+                let sighting = BleSighting {
+                    address,
+                    address_type: BleAddressType::from_random(address),
+                    sections: vec![(0x01, vec![0x1A])],
+                    ..Default::default()
+                };
+                let obs = ble_observation(&sighting, 0, bt, &oui);
                 let period = rng.range(20.0, 120.0);
                 let on = rng.range(0.3, 0.9);
                 let phase = rng.f32();
                 out.push(
-                    SimDevice::new(DeviceKey::Ble(address), DeviceDetails::Ble(info), Some(rng.range(-98.0, -60.0)))
+                    SimDevice::new(obs.key, obs.details, Some(rng.range(-98.0, -60.0)))
                         .presence(Presence::Cycle { period, on, phase }),
                 );
             }
@@ -664,7 +755,7 @@ mod tests {
     #[test]
     fn evil_twin_appears_on_schedule() {
         let cfg = SimConfig { evil_twin_after: Some(Duration::from_secs(20)), ..Default::default() };
-        let mut w = SimWorld::new(&cfg);
+        let mut w = SimWorld::new(&cfg, &BtDb::builtin());
         let home_aps = |obs: &[Observation]| {
             obs.iter()
                 .filter_map(|o| match &o.details {
@@ -688,9 +779,9 @@ mod tests {
 
     #[test]
     fn world_contains_every_device_class() {
-        let mut w = SimWorld::new(&SimConfig { extra_devices: 100, ..Default::default() });
+        let mut w = SimWorld::new(&SimConfig { extra_devices: 100, ..Default::default() }, &BtDb::builtin());
         let obs = w.step(Duration::from_secs(1));
-        for kind in [DeviceKind::AccessPoint, DeviceKind::Ble, DeviceKind::LanHost] {
+        for kind in [DeviceKind::AccessPoint, DeviceKind::Ble, DeviceKind::BtClassic, DeviceKind::LanHost] {
             assert!(obs.iter().any(|o| o.key.kind() == kind), "missing {kind:?}");
         }
         // LAN hosts are wired: no RSSI.
@@ -698,10 +789,28 @@ mod tests {
     }
 
     #[test]
+    fn ble_devices_are_identified_by_the_real_decoders() {
+        // Inspect the whole world: some devices are on presence cycles and absent right now.
+        let w = SimWorld::new(&SimConfig::default(), &BtDb::builtin());
+        let types: Vec<&str> = w
+            .devices
+            .iter()
+            .filter(|d| matches!(d.key, DeviceKey::Ble(_) | DeviceKey::BtClassic(_)))
+            .flat_map(|d| d.evidence.iter())
+            .filter(|e| e.kind == ClaimKind::DeviceType)
+            .map(|e| e.value.as_str())
+            .collect();
+        for expected in ["Headphones", "Tracker tag", "Desktop PC", "Mouse", "Vehicle", "Heart-rate sensor", "Laptop"] {
+            assert!(types.contains(&expected), "no {expected} in {types:?}");
+        }
+    }
+
+    #[test]
     fn deterministic_for_a_seed() {
         let cfg = SimConfig::default();
-        let a: Vec<_> = SimWorld::new(&cfg).step(Duration::from_secs(1)).into_iter().map(|o| (o.key, o.rssi)).collect();
-        let b: Vec<_> = SimWorld::new(&cfg).step(Duration::from_secs(1)).into_iter().map(|o| (o.key, o.rssi)).collect();
+        let db = BtDb::builtin();
+        let a: Vec<_> = SimWorld::new(&cfg, &db).step(Duration::from_secs(1)).into_iter().map(|o| (o.key, o.rssi)).collect();
+        let b: Vec<_> = SimWorld::new(&cfg, &db).step(Duration::from_secs(1)).into_iter().map(|o| (o.key, o.rssi)).collect();
         assert_eq!(a, b);
     }
 }

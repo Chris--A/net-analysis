@@ -4,9 +4,13 @@
 
 mod engine;
 pub mod identify;
+pub mod parse;
 pub mod sources;
 mod store;
 
 pub use engine::{Engine, EngineConfig, EngineHandle, StalePolicy};
+pub use identify::{BtDb, OuiDb};
+pub use sources::ble::BleConfig;
 pub use sources::sim::SimConfig;
+pub use sources::wifi::WifiConfig;
 pub use store::DeviceStore;

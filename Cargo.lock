@@ -4043,6 +4043,7 @@ dependencies = [
  "anyhow",
  "flume",
  "na-model",
+ "na-platform",
  "tokio",
  "tokio-util",
  "tracing",
@@ -4055,6 +4056,16 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "na-platform"
+version = "0.1.0"
+dependencies = [
+ "na-model",
+ "thiserror 2.0.21",
+ "windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -7,7 +7,7 @@ use crate::bridge::Registry;
 use crate::picking::Selection;
 use crate::scene::kind_color;
 
-const FILTER_KINDS: [DeviceKind; 3] = [DeviceKind::AccessPoint, DeviceKind::Ble, DeviceKind::LanHost];
+const FILTER_KINDS: [DeviceKind; 4] = [DeviceKind::AccessPoint, DeviceKind::Ble, DeviceKind::BtClassic, DeviceKind::LanHost];
 const LIST_ORDER: [DeviceKind; 5] = [
     DeviceKind::AccessPoint,
     DeviceKind::LanHost,

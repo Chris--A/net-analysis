@@ -1,6 +1,10 @@
 use bevy_egui::egui::{self, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
-use na_model::{ApInfo, BleInfo, ClaimKind, Device, LanInfo, now_millis};
+use na_engine::BtDb;
+use na_engine::identify::ble::{cod_services, describe_manufacturer, uuid_label};
+use na_engine::identify::{VendorIeKind, appearance_label, class_of_device_label, vendor_ie_info};
+use na_engine::parse::{ble_ad, ie};
+use na_model::{ApInfo, BleInfo, BtClassicInfo, ClaimKind, Device, LanInfo, now_millis};
 
 use super::theme::{ACCENT, DANGER, WARN, WEAK};
 use super::{ago, color32, duration_text};
@@ -8,7 +12,7 @@ use crate::bridge::Registry;
 use crate::picking::Selection;
 use crate::scene::kind_color;
 
-pub fn show(root: &mut egui::Ui, reg: &Registry, sel: &mut Selection) {
+pub fn show(root: &mut egui::Ui, reg: &Registry, sel: &mut Selection, bt: &BtDb) {
     egui::Panel::right("inspector")
         .resizable(true)
         .default_size(340.0)
@@ -24,11 +28,11 @@ pub fn show(root: &mut egui::Ui, reg: &Registry, sel: &mut Selection) {
             egui::ScrollArea::vertical()
                 .id_salt("inspector")
                 .auto_shrink(false)
-                .show(ui, |ui| device(ui, d, reg, sel));
+                .show(ui, |ui| device(ui, d, reg, sel, bt));
         });
 }
 
-fn device(ui: &mut egui::Ui, d: &Device, reg: &Registry, sel: &mut Selection) {
+fn device(ui: &mut egui::Ui, d: &Device, reg: &Registry, sel: &mut Selection, bt: &BtDb) {
     let now = now_millis();
     ui.horizontal(|ui| {
         ui.heading(RichText::new(d.display_name()).color(color32(kind_color(d.kind))));
@@ -96,7 +100,8 @@ fn device(ui: &mut egui::Ui, d: &Device, reg: &Registry, sel: &mut Selection) {
 
     match &d.details {
         na_model::DeviceDetails::Ap(ap) => ap_details(ui, ap),
-        na_model::DeviceDetails::Ble(b) => ble_details(ui, b),
+        na_model::DeviceDetails::Ble(b) => ble_details(ui, b, bt),
+        na_model::DeviceDetails::BtClassic(c) => classic_details(ui, c),
         na_model::DeviceDetails::Lan(l) => lan_details(ui, l),
         na_model::DeviceDetails::None => {}
     }
@@ -168,8 +173,18 @@ fn ap_details(ui: &mut egui::Ui, ap: &ApInfo) {
         if let Some(g) = ap.wifi_gen {
             kv(ui, "Generation", format!("Wi-Fi {g}"));
         }
-        if let Some(up) = ap.tsf_uptime_secs {
-            kv(ui, "Radio uptime", duration_text(up));
+        match ap.tsf_uptime_secs {
+            Some(up) => kv(ui, "Radio uptime", duration_text(up)),
+            None => kv(ui, "Radio uptime", RichText::new("unknown / randomized TSF").color(WEAK)),
+        }
+        if let Some(n) = ap.station_count {
+            kv(ui, "Clients", n.to_string());
+        }
+        if let Some(u) = ap.channel_utilization {
+            kv(ui, "Channel busy", format!("{:.0}%", f32::from(u) / 255.0 * 100.0));
+        }
+        if let Some(cc) = &ap.country {
+            kv(ui, "Country", cc.as_str());
         }
         kv(ui, "Beacon interval", format!("{} TU", ap.beacon_interval_tu));
         kv(ui, "IE fingerprint", RichText::new(format!("{:016x}", ap.ie_fingerprint)).monospace());
@@ -188,31 +203,157 @@ fn ap_details(ui: &mut egui::Ui, ap: &ApInfo) {
                 }
             }
         }
+        if !ap.vendor_ies.is_empty() {
+            let names: Vec<String> = ap
+                .vendor_ies
+                .iter()
+                .map(|t| match vendor_ie_info(t) {
+                    Some((name, VendorIeKind::Chipset)) => format!("{name} (chipset)"),
+                    Some((name, _)) => name.to_owned(),
+                    None => format!("{:02X}:{:02X}:{:02X}/{}", t[0], t[1], t[2], t[3]),
+                })
+                .collect();
+            kv(ui, "Vendor IEs", names.join(", "));
+        }
     });
+    raw_ies(ui, &ap.raw_ies);
 }
 
-fn ble_details(ui: &mut egui::Ui, b: &BleInfo) {
+/// Collapsible decoded list of every information element, with a hex preview.
+fn raw_ies(ui: &mut egui::Ui, raw: &[u8]) {
+    if raw.is_empty() {
+        return;
+    }
+    let elements: Vec<_> = ie::elements(raw).collect();
+    egui::CollapsingHeader::new(format!("Information elements ({}, {} bytes)", elements.len(), raw.len()))
+        .id_salt("raw_ies")
+        .show(ui, |ui| {
+            for e in elements {
+                let id = match e.ext_id {
+                    Some(x) => format!("255/{x}"),
+                    None => e.id.to_string(),
+                };
+                ui.label(
+                    RichText::new(format!("{id:>6}  {}  ({} B)", ie::element_name(e.id, e.ext_id), e.data.len()))
+                        .monospace()
+                        .size(11.5),
+                );
+                const PREVIEW: usize = 24;
+                let mut hex: Vec<String> = e.data.iter().take(PREVIEW).map(|b| format!("{b:02X}")).collect();
+                if e.data.len() > PREVIEW {
+                    hex.push("…".into());
+                }
+                if !hex.is_empty() {
+                    ui.label(RichText::new(format!("        {}", hex.join(" "))).monospace().small().color(WEAK));
+                }
+            }
+        });
+}
+
+fn hex(bytes: &[u8], max: usize) -> String {
+    let mut parts: Vec<String> = bytes.iter().take(max).map(|b| format!("{b:02X}")).collect();
+    if bytes.len() > max {
+        parts.push("…".into());
+    }
+    parts.join(" ")
+}
+
+fn ble_details(ui: &mut egui::Ui, b: &BleInfo, bt: &BtDb) {
     section(ui, "Bluetooth LE");
     egui::Grid::new("ble").num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
-        let kind = if b.random_address { "random (rotates)" } else { "public" };
-        kv(ui, "Address", RichText::new(format!("{}  ({kind})", b.address)).monospace());
+        kv(ui, "Address", RichText::new(b.address.to_string()).monospace());
+        let mut kind = RichText::new(b.address_type.label());
+        if b.address_type.is_rotating() {
+            kind = kind.color(WEAK);
+        }
+        kv(ui, "Address type", kind);
         if let Some(n) = &b.local_name {
-            kv(ui, "Local name", n.as_str());
+            kv(ui, "Name", n.as_str());
         }
-        if let Some(c) = b.company_id {
-            kv(ui, "Company ID", RichText::new(format!("0x{c:04X}")).monospace());
+        if b.connected {
+            kv(ui, "Status", RichText::new("connected to this host").color(ACCENT));
+        } else if b.paired {
+            kv(ui, "Status", "paired");
         }
-        if !b.manufacturer_data.is_empty() {
-            let hex: Vec<String> = b.manufacturer_data.iter().map(|x| format!("{x:02X}")).collect();
-            kv(ui, "Mfr data", RichText::new(hex.join(" ")).monospace());
-        }
-        if !b.service_uuids.is_empty() {
-            kv(ui, "Services", b.service_uuids.join(", "));
+        if let Some(a) = b.appearance {
+            kv(ui, "Appearance", format!("{} (0x{a:04X})", appearance_label(a)));
         }
         if let Some(tx) = b.tx_power {
             kv(ui, "TX power", format!("{tx} dBm"));
         }
+        if let Some(f) = b.flags {
+            kv(ui, "Flags", ble_ad::flag_labels(f).join(", "));
+        }
         kv(ui, "Connectable", if b.connectable { "yes" } else { "no" });
+        for m in &b.manufacturer_data {
+            let who = bt.company(m.company_id).unwrap_or("unregistered");
+            kv(ui, "Manufacturer", format!("{who} (0x{:04X})", m.company_id));
+            if let Some(meaning) = describe_manufacturer(m.company_id, &m.data) {
+                kv(ui, "", RichText::new(meaning).color(ACCENT));
+            }
+            if !m.data.is_empty() {
+                kv(ui, "", RichText::new(hex(&m.data, 20)).monospace().small().color(WEAK));
+            }
+        }
+        if !b.service_uuids.is_empty() {
+            let names: Vec<String> = b.service_uuids.iter().map(|u| uuid_label(*u, bt)).collect();
+            kv(ui, "Services", names.join(", "));
+        }
+        for s in &b.service_data {
+            kv(ui, "Service data", uuid_label(s.uuid, bt));
+            if !s.data.is_empty() {
+                kv(ui, "", RichText::new(hex(&s.data, 20)).monospace().small().color(WEAK));
+            }
+        }
+    });
+    raw_ad(ui, &b.raw_ad);
+}
+
+/// Collapsible list of every AD structure heard from the device.
+fn raw_ad(ui: &mut egui::Ui, raw: &[u8]) {
+    if raw.is_empty() {
+        return;
+    }
+    let structures: Vec<_> = ble_ad::structures(raw).collect();
+    egui::CollapsingHeader::new(format!("Advertising data ({}, {} bytes)", structures.len(), raw.len()))
+        .id_salt("raw_ad")
+        .show(ui, |ui| {
+            for s in structures {
+                ui.label(
+                    RichText::new(format!("  0x{:02X}  {}  ({} B)", s.ad_type, ble_ad::ad_type_name(s.ad_type), s.data.len()))
+                        .monospace()
+                        .size(11.5),
+                );
+                if !s.data.is_empty() {
+                    ui.label(RichText::new(format!("        {}", hex(s.data, 24))).monospace().small().color(WEAK));
+                }
+            }
+        });
+}
+
+fn classic_details(ui: &mut egui::Ui, c: &BtClassicInfo) {
+    section(ui, "Bluetooth Classic");
+    egui::Grid::new("bt_classic").num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+        kv(ui, "Address", RichText::new(c.address.to_string()).monospace());
+        if let Some(n) = &c.name {
+            kv(ui, "Name", n.as_str());
+        }
+        if c.class_of_device != 0 {
+            kv(ui, "Class", format!("{} (0x{:06X})", class_of_device_label(c.class_of_device), c.class_of_device));
+            let services = cod_services(c.class_of_device);
+            if !services.is_empty() {
+                kv(ui, "Service classes", services.join(", "));
+            }
+        }
+        let status = match (c.connected, c.paired) {
+            (true, _) => RichText::new("connected to this host").color(ACCENT),
+            (false, true) => RichText::new("paired"),
+            _ => RichText::new("not paired").color(WEAK),
+        };
+        kv(ui, "Status", status);
+        if c.discoverable {
+            kv(ui, "Discoverable", RichText::new("yes — answered the last inquiry").color(WARN));
+        }
     });
 }
 

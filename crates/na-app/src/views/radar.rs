@@ -3,7 +3,7 @@
 //! - LAN hosts sit on an inner core ring, evenly spaced by IP.
 //! - APs sit on the Wi-Fi ring at a radius set by RSSI. Each SSID owns an angular
 //!   sector, so an evil twin lands inside the real network's cluster.
-//! - BLE devices form an outer spherical shell that slowly drifts.
+//! - Bluetooth devices form an outer spherical shell that slowly drifts.
 
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_4, TAU};
@@ -64,7 +64,9 @@ pub fn layout(
             _ => {
                 let az = unit_hash(d.id.0, 1) * TAU + drift;
                 let el = (unit_hash(d.id.0, 2) - 0.5) * 1.1;
-                let r = R_BLE_IN + (1.0 - signal01(d.rssi)) * (R_BLE_OUT - R_BLE_IN);
+                // Connected devices stop advertising (no RSSI) but are close by definition.
+                let signal = if d.rssi.is_none() && connected(d) { 0.85 } else { signal01(d.rssi) };
+                let r = R_BLE_IN + (1.0 - signal) * (R_BLE_OUT - R_BLE_IN);
                 LayoutTarget::new(spherical(r, az, el), Quat::IDENTITY, Vec3::splat(0.55))
             }
         };
@@ -73,6 +75,10 @@ pub fn layout(
     if let Ok(mut t) = me.single_mut() {
         *t = LayoutTarget::new(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE);
     }
+}
+
+fn connected(d: &Device) -> bool {
+    d.ble().is_some_and(|b| b.connected) || d.bt_classic().is_some_and(|c| c.connected)
 }
 
 /// Stable, evenly spaced slots for LAN hosts, ordered by IP address.
@@ -118,6 +124,6 @@ pub fn scenery(mut gizmos: Gizmos, cam: Query<&GlobalTransform, With<MainCamera>
     label(&mut gizmos, rot, Vec3::new(0.0, 0.3, -R_LAN - 0.6), "LAN", 0.55, dim(lan, 1.2));
     label(&mut gizmos, rot, Vec3::new(0.0, 0.3, -R_WIFI_IN + 0.6), "Wi-Fi  -30 dBm", 0.5, dim(wifi, 1.2));
     label(&mut gizmos, rot, Vec3::new(0.0, 0.3, -R_WIFI_OUT - 0.6), "-100 dBm", 0.5, dim(wifi, 0.8));
-    label(&mut gizmos, rot, Vec3::new(0.0, 0.3, -R_BLE_OUT - 0.8), "Bluetooth LE", 0.6, dim(ble, 1.2));
+    label(&mut gizmos, rot, Vec3::new(0.0, 0.3, -R_BLE_OUT - 0.8), "Bluetooth", 0.6, dim(ble, 1.2));
     label(&mut gizmos, rot, Vec3::new(0.0, 1.1, 0.0), "you", 0.45, LinearRgba::gray(1.5));
 }

@@ -15,6 +15,10 @@ pub enum EvidenceSource {
     /// Port or service banner probe.
     Banner,
     BleAdv,
+    /// Bluetooth Classic Class of Device.
+    BtClass,
+    /// What the OS learned about a paired/connected Bluetooth device (GATT name, appearance).
+    BtPaired,
     Dhcp,
     TcpFingerprint,
     /// Cross-source inference, e.g. BSSID ± 1 matching a LAN MAC.
@@ -32,6 +36,8 @@ impl EvidenceSource {
             Self::NetBios => "NetBIOS",
             Self::Banner => "Banner",
             Self::BleAdv => "BLE adv",
+            Self::BtClass => "BT class",
+            Self::BtPaired => "BT paired",
             Self::Dhcp => "DHCP",
             Self::TcpFingerprint => "TCP fp",
             Self::Heuristic => "Heuristic",

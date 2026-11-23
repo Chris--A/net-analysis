@@ -14,7 +14,7 @@ mod mac;
 mod wifi;
 
 pub use alert::{Alert, AlertKind, Severity};
-pub use ble::BleInfo;
+pub use ble::{BleAddressType, BleInfo, BleUuid, BtClassicInfo, ManufacturerData, ParseUuidError, ServiceData};
 pub use device::{
     Device, DeviceDetails, DeviceId, DeviceKey, DeviceKind, Millis, RSSI_HISTORY_LEN, RssiSample,
     now_millis,

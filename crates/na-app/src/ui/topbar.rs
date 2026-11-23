@@ -74,8 +74,12 @@ pub fn show(
                 if let Some(fps) = fps {
                     ui.label(RichText::new(format!("{fps:.0} fps")).small().color(WEAK));
                 }
-                for kind in [DeviceKind::Ble, DeviceKind::LanHost, DeviceKind::AccessPoint] {
+                // Right-to-left layout: this reads AP, LAN, BLE, Classic on screen.
+                for kind in [DeviceKind::BtClassic, DeviceKind::Ble, DeviceKind::LanHost, DeviceKind::AccessPoint] {
                     let n = reg.devices.values().filter(|d| d.kind == kind).count();
+                    if n == 0 && kind == DeviceKind::BtClassic {
+                        continue;
+                    }
                     ui.label(RichText::new(format!("{} {n}", kind.label())).color(color32(kind_color(kind))));
                 }
             });

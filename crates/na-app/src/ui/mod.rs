@@ -15,6 +15,7 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
+use na_engine::BtDb;
 use na_model::{Device, DeviceKind};
 
 use crate::bridge::{DeviceNode, EngineLink, Registry};
@@ -27,9 +28,14 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UiState>()
+            .insert_resource(BtNames(BtDb::load_default()))
             .add_systems(EguiPrimaryContextPass, ui_system);
     }
 }
+
+/// Bluetooth SIG company / UUID names, for labelling raw advert data.
+#[derive(Resource)]
+pub struct BtNames(pub BtDb);
 
 #[derive(Resource)]
 pub struct UiState {
@@ -86,6 +92,7 @@ fn ui_system(
     window: Single<&Window, With<PrimaryWindow>>,
     nodes: Query<(&DeviceNode, &GlobalTransform, &Transform)>,
     diagnostics: Res<DiagnosticsStore>,
+    bt: Res<BtNames>,
 ) -> Result {
     let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
@@ -108,7 +115,7 @@ fn ui_system(
     topbar::show(&mut root, view, &mut next_view, &mut ui_state, &reg, link.as_deref(), fps);
     alerts::show(&mut root, &reg, &mut sel);
     device_list::show(&mut root, &mut ui_state, &reg, &mut sel);
-    inspector::show(&mut root, &reg, &mut sel);
+    inspector::show(&mut root, &reg, &mut sel, &bt.0);
 
     let central = root.available_rect_before_wrap();
     let (ref mut cam, cam_tf) = *camera;

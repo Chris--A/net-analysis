@@ -33,11 +33,13 @@ impl Plugin for BridgePlugin {
 }
 
 /// Command-line options:
-/// - `--extra N`: add N load-test devices
-/// - `--twin-after SECS`: when the evil twin appears (0 disables it)
+/// - `--sim`: use the built-in simulator instead of the real scanners
+/// - `--extra N`: add N load-test devices (simulator)
+/// - `--twin-after SECS`: when the simulated evil twin appears (0 disables it)
 /// - `--screenshot-dir DIR`: run the screenshot tour
 #[derive(Resource, Clone, Debug)]
 pub struct LaunchOptions {
+    pub sim: bool,
     pub extra_devices: usize,
     pub twin_after_secs: u64,
     pub screenshot_dir: Option<std::path::PathBuf>,
@@ -45,12 +47,13 @@ pub struct LaunchOptions {
 
 impl LaunchOptions {
     pub fn from_args() -> Self {
+        let args: Vec<String> = std::env::args().collect();
         let mut opts = Self {
+            sim: args.iter().any(|a| a == "--sim"),
             extra_devices: 0,
             twin_after_secs: 20,
             screenshot_dir: None,
         };
-        let args: Vec<String> = std::env::args().collect();
         for pair in args.windows(2) {
             match pair[0].as_str() {
                 "--extra" => opts.extra_devices = pair[1].parse().unwrap_or(0),
@@ -128,6 +131,11 @@ impl Registry {
 
 fn start_engine(mut commands: Commands, opts: Res<LaunchOptions>) {
     let cfg = EngineConfig {
+        sources: if opts.sim {
+            vec![SourceKind::Sim]
+        } else {
+            EngineConfig::real_sources()
+        },
         sim: SimConfig {
             extra_devices: opts.extra_devices,
             evil_twin_after: (opts.twin_after_secs > 0)

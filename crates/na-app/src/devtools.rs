@@ -1,5 +1,6 @@
 //! `--screenshot-dir DIR`: a scripted tour for visual verification.
-//! It captures each view, plus the inspector with the evil twin selected, then exits.
+//! It captures each view, then the inspector with the evil twin, a BLE device and a
+//! Classic device selected, then exits.
 //! Combine with `--twin-after 3` so the twin is present early.
 
 use std::path::{Path, PathBuf};
@@ -88,7 +89,35 @@ fn run_tour(
         }
         3 => {
             shot(&mut commands, &dir, "4-radar-selected.png");
+            (0.5, false)
+        }
+        // A capture shows the end-of-frame state, so change the selection a step before each shot.
+        4 => {
+            // The best-identified BLE device: decoded model first, then signal.
+            sel.selected = reg
+                .devices
+                .values()
+                .filter(|d| d.kind == DeviceKind::Ble)
+                .max_by_key(|d| (d.identity.model.is_some(), d.rssi.unwrap_or(i16::MIN)))
+                .map(|d| d.id);
             (2.0, false)
+        }
+        5 => {
+            shot(&mut commands, &dir, "5-ble-selected.png");
+            (0.5, false)
+        }
+        6 => {
+            sel.selected = reg
+                .devices
+                .values()
+                .filter(|d| d.kind == DeviceKind::BtClassic)
+                .max_by_key(|d| d.bt_classic().is_some_and(|c| c.connected))
+                .map(|d| d.id);
+            (2.0, false)
+        }
+        7 => {
+            shot(&mut commands, &dir, "6-classic-selected.png");
+            (1.0, false)
         }
         _ => (0.0, true),
     };

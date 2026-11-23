@@ -26,6 +26,9 @@ const UNIT6: f32 = 0.11; // 0.44 per 20 MHz channel
 pub const CENTER_X: f32 = 5.0;
 const TOWER_W: f32 = 0.45;
 const ROW_SPACING: f32 = 1.3;
+const MIN_ROW_SPACING: f32 = 0.55;
+/// Depth (scene units) the deepest channel stack may occupy before rows compress.
+const MAX_DEPTH: f32 = 10.0;
 /// Only the strongest towers get a floating SSID label, to avoid clutter.
 const MAX_TOWER_LABELS: usize = 25;
 
@@ -63,22 +66,37 @@ fn bonded_center(ap: &ApInfo) -> f32 {
     f32::from(start) + f32::from(2 * (n - 1))
 }
 
-/// Row index for each AP. APs sharing a channel stack front-to-back, strongest first.
-fn rows(reg: &Registry) -> HashMap<DeviceId, usize> {
+/// Row layout. APs sharing a channel stack front-to-back, strongest first.
+/// Spacing shrinks as the deepest stack grows, so the city stays on screen.
+struct Rows {
+    index: HashMap<DeviceId, usize>,
+    spacing: f32,
+}
+
+impl Rows {
+    fn z(&self, id: DeviceId) -> f32 {
+        1.5 + self.index.get(&id).copied().unwrap_or(0) as f32 * self.spacing
+    }
+}
+
+fn rows(reg: &Registry) -> Rows {
     let mut groups: HashMap<(Band, u16), Vec<&Device>> = HashMap::new();
     for d in reg.devices.values() {
         if let Some(ap) = d.ap() {
             groups.entry((ap.band, ap.channel)).or_default().push(d);
         }
     }
-    let mut out = HashMap::new();
+    let mut index = HashMap::new();
+    let mut deepest = 0;
     for list in groups.values_mut() {
         list.sort_by_key(|d| (std::cmp::Reverse(d.rssi.unwrap_or(i16::MIN)), d.id));
+        deepest = deepest.max(list.len());
         for (i, d) in list.iter().enumerate() {
-            out.insert(d.id, i);
+            index.insert(d.id, i);
         }
     }
-    out
+    let spacing = (MAX_DEPTH / deepest.max(1) as f32).clamp(MIN_ROW_SPACING, ROW_SPACING);
+    Rows { index, spacing }
 }
 
 fn tower_height(d: &Device) -> f32 {
@@ -98,9 +116,8 @@ pub fn layout(
         *target = match d.ap() {
             Some(ap) => {
                 let h = tower_height(d);
-                let row = rows.get(&d.id).copied().unwrap_or(0);
                 let x = channel_x(ap.band, ap.channel);
-                let z = 1.5 + row as f32 * ROW_SPACING;
+                let z = rows.z(d.id);
                 LayoutTarget::new(Vec3::new(x, h / 2.0, z), Quat::IDENTITY, Vec3::new(TOWER_W, h, TOWER_W))
             }
             None => {
@@ -167,12 +184,7 @@ pub fn scenery(reg: Res<Registry>, mut gizmos: Gizmos, cam: Query<&GlobalTransfo
         let Some(ap) = d.ap() else {
             continue;
         };
-        let row = rows.get(&d.id).copied().unwrap_or(0);
-        let top = Vec3::new(
-            channel_x(ap.band, ap.channel),
-            tower_height(d) + 0.45,
-            1.5 + row as f32 * ROW_SPACING,
-        );
+        let top = Vec3::new(channel_x(ap.band, ap.channel), tower_height(d) + 0.45, rows.z(d.id));
         label(&mut gizmos, cam_rot, top, ap.display_ssid(), 0.3, dim(security_color(&ap.security), 1.2));
     }
 
@@ -181,8 +193,7 @@ pub fn scenery(reg: Res<Registry>, mut gizmos: Gizmos, cam: Query<&GlobalTransfo
         let Some(ap) = d.ap() else {
             continue;
         };
-        let row = rows.get(&d.id).copied().unwrap_or(0);
-        let z = 1.5 + row as f32 * ROW_SPACING + TOWER_W;
+        let z = rows.z(d.id) + TOWER_W;
         let center = channel_x(ap.band, 0) + bonded_center(ap) * units_per_channel_number(ap.band);
         // 20 MHz spans 4 channel numbers in every band.
         let half = f32::from(ap.width_mhz) / 20.0 * 4.0 * units_per_channel_number(ap.band) / 2.0;
@@ -214,6 +225,11 @@ mod tests {
             wps: None,
             ie_fingerprint: 0,
             connected: false,
+            station_count: None,
+            channel_utilization: None,
+            country: None,
+            vendor_ies: Vec::new(),
+            raw_ies: Vec::new(),
         }
     }
 

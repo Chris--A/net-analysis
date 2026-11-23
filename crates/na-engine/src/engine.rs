@@ -6,13 +6,17 @@ use na_model::{EngineCommand, EngineEvent, SourceKind, SourceState, now_millis};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::sources::{self, ObservationSink};
-use crate::{DeviceStore, SimConfig};
+use crate::identify::{BtDb, OuiDb};
+use crate::sources::{self, ObservationSink, SourceCtx, SourceDeps};
+use crate::{BleConfig, DeviceStore, SimConfig, WifiConfig};
 
 /// How long each device class may go unseen before it is dropped.
 #[derive(Clone, Copy, Debug)]
 pub struct StalePolicy {
+    /// LE devices are re-heard every second while present.
     pub bluetooth: Duration,
+    /// Classic devices are only re-confirmed by the periodic inquiry, so they need longer.
+    pub bt_classic: Duration,
     pub wifi: Duration,
     pub lan: Duration,
 }
@@ -21,6 +25,7 @@ impl Default for StalePolicy {
     fn default() -> Self {
         Self {
             bluetooth: Duration::from_secs(30),
+            bt_classic: Duration::from_secs(240),
             wifi: Duration::from_secs(60),
             lan: Duration::from_secs(300),
         }
@@ -32,6 +37,8 @@ pub struct EngineConfig {
     /// Sources to start immediately.
     pub sources: Vec<SourceKind>,
     pub sim: SimConfig,
+    pub wifi: WifiConfig,
+    pub ble: BleConfig,
     /// How often changed devices are pushed to the frontend.
     pub flush_interval: Duration,
     pub stale: StalePolicy,
@@ -42,9 +49,18 @@ impl Default for EngineConfig {
         Self {
             sources: vec![SourceKind::Sim],
             sim: SimConfig::default(),
+            wifi: WifiConfig::default(),
+            ble: BleConfig::default(),
             flush_interval: Duration::from_millis(200),
             stale: StalePolicy::default(),
         }
+    }
+}
+
+impl EngineConfig {
+    /// Real scanners available on this platform (simulator excluded).
+    pub fn real_sources() -> Vec<SourceKind> {
+        vec![SourceKind::Wifi, SourceKind::Ble]
     }
 }
 
@@ -120,9 +136,22 @@ async fn run(
     let (obs_tx, mut obs_rx) = tokio::sync::mpsc::channel(4096);
     let mut store = DeviceStore::new(cfg.stale);
     let mut running: HashMap<SourceKind, RunningSource> = HashMap::new();
+    let (oui, bt) = tokio::join!(
+        tokio::task::spawn_blocking(OuiDb::load_default),
+        tokio::task::spawn_blocking(BtDb::load_default),
+    );
+    let spawner = Spawner {
+        cfg: &cfg,
+        deps: SourceDeps {
+            oui: std::sync::Arc::new(oui.unwrap_or_default()),
+            bt: std::sync::Arc::new(bt.unwrap_or_default()),
+        },
+        obs_tx: &obs_tx,
+        evt_tx: &evt_tx,
+    };
 
     for kind in &cfg.sources {
-        start_source(*kind, &cfg, &obs_tx, &evt_tx, &mut running);
+        spawner.start(*kind, &mut running);
     }
 
     let mut flush = tokio::time::interval(cfg.flush_interval);
@@ -136,7 +165,7 @@ async fn run(
             Some(obs) = obs_rx.recv() => store.ingest(obs),
             cmd = cmd_rx.recv_async() => match cmd {
                 Ok(EngineCommand::SetSourceEnabled { source, enabled: true }) => {
-                    start_source(source, &cfg, &obs_tx, &evt_tx, &mut running);
+                    spawner.start(source, &mut running);
                 }
                 Ok(EngineCommand::SetSourceEnabled { source, enabled: false }) => {
                     if let Some(r) = running.remove(&source) {
@@ -167,43 +196,46 @@ fn send_all(tx: &flume::Sender<EngineEvent>, events: Vec<EngineEvent>) -> bool {
     events.into_iter().all(|e| tx.send(e).is_ok())
 }
 
-fn start_source(
-    kind: SourceKind,
-    cfg: &EngineConfig,
-    obs_tx: &ObservationSink,
-    evt_tx: &flume::Sender<EngineEvent>,
-    running: &mut HashMap<SourceKind, RunningSource>,
-) {
-    if running.get(&kind).is_some_and(|r| !r.task.is_finished()) {
-        return;
-    }
-    let status = move |state| EngineEvent::SourceStatus { source: kind, state };
+/// Everything needed to start a source task.
+struct Spawner<'a> {
+    cfg: &'a EngineConfig,
+    deps: SourceDeps,
+    obs_tx: &'a ObservationSink,
+    evt_tx: &'a flume::Sender<EngineEvent>,
+}
 
-    let source = match sources::make_source(kind, cfg) {
-        Ok(s) => s,
-        Err(reason) => {
-            warn!(?kind, %reason, "source unavailable");
-            let _ = evt_tx.send(status(SourceState::Unavailable(reason)));
+impl Spawner<'_> {
+    fn start(&self, kind: SourceKind, running: &mut HashMap<SourceKind, RunningSource>) {
+        if running.get(&kind).is_some_and(|r| !r.task.is_finished()) {
             return;
         }
-    };
+        let status = move |state| EngineEvent::SourceStatus { source: kind, state };
 
-    let cancel = CancellationToken::new();
-    let evt = evt_tx.clone();
-    let sink = obs_tx.clone();
-    let token = cancel.clone();
-    let task = tokio::spawn(async move {
-        let _ = evt.send(status(SourceState::Running));
-        let state = match source.run(sink, token).await {
-            Ok(()) => SourceState::Stopped,
-            Err(e) => {
-                warn!(?kind, error = %e, "source failed");
-                SourceState::Failed(format!("{e:#}"))
+        let source = match sources::make_source(kind, self.cfg, &self.deps) {
+            Ok(s) => s,
+            Err(reason) => {
+                warn!(?kind, %reason, "source unavailable");
+                let _ = self.evt_tx.send(status(SourceState::Unavailable(reason)));
+                return;
             }
         };
-        let _ = evt.send(status(state));
-    });
-    running.insert(kind, RunningSource { cancel, task });
+
+        let cancel = CancellationToken::new();
+        let evt = self.evt_tx.clone();
+        let ctx = SourceCtx::new(kind, self.obs_tx.clone(), cancel.clone(), self.evt_tx.clone());
+        let task = tokio::spawn(async move {
+            let _ = evt.send(status(SourceState::Running));
+            let state = match source.run(ctx).await {
+                Ok(()) => SourceState::Stopped,
+                Err(e) => {
+                    warn!(?kind, error = %e, "source failed");
+                    SourceState::Failed(format!("{e:#}"))
+                }
+            };
+            let _ = evt.send(status(state));
+        });
+        running.insert(kind, RunningSource { cancel, task });
+    }
 }
 
 #[cfg(test)]

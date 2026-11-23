@@ -1,4 +1,6 @@
 /target
+/data/*.csv
+/data/*.yaml
 *.pdb
 *.db
 *.db-journal

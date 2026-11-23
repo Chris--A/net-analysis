@@ -24,6 +24,10 @@ impl Band {
 pub enum Akm {
     /// No RSN IE: an open network.
     Open,
+    /// Privacy bit set but no RSN/WPA IE: legacy WEP.
+    Wep,
+    /// Pre-RSN WPA (vendor IE, usually TKIP).
+    Wpa1,
     /// Opportunistic Wireless Encryption ("Enhanced Open").
     Owe,
     Psk,
@@ -37,6 +41,8 @@ impl Akm {
     pub fn label(self) -> &'static str {
         match self {
             Akm::Open => "Open",
+            Akm::Wep => "WEP",
+            Akm::Wpa1 => "WPA (legacy)",
             Akm::Owe => "OWE",
             Akm::Psk => "WPA2-PSK",
             Akm::Sae => "WPA3-SAE",
@@ -49,8 +55,8 @@ impl Akm {
     /// Rough ordering used for downgrade detection.
     fn strength(self) -> u8 {
         match self {
-            Akm::Open | Akm::Other(_) => 0,
-            Akm::Owe => 1,
+            Akm::Open | Akm::Wep | Akm::Other(_) => 0,
+            Akm::Wpa1 | Akm::Owe => 1,
             Akm::Psk => 2,
             Akm::Sae => 3,
             Akm::Eap => 4,
@@ -140,6 +146,16 @@ pub struct ApInfo {
     pub ie_fingerprint: u64,
     /// This host is currently associated with this BSSID.
     pub connected: bool,
+    /// Associated clients, from the BSS Load element.
+    pub station_count: Option<u16>,
+    /// Channel busy fraction, 0 to 255, from the BSS Load element.
+    pub channel_utilization: Option<u8>,
+    /// Country element (two-letter code).
+    pub country: Option<String>,
+    /// Vendor-specific IEs present, as OUI + vendor type.
+    pub vendor_ies: Vec<[u8; 4]>,
+    /// The information elements as last received, for the inspector.
+    pub raw_ies: Vec<u8>,
 }
 
 impl ApInfo {

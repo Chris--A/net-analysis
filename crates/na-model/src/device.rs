@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ApInfo, BleInfo, Evidence, Identity, LanInfo, MacAddr, stable_hash};
+use crate::{ApInfo, BleInfo, BtClassicInfo, Evidence, Identity, LanInfo, MacAddr, stable_hash};
 
 /// Milliseconds since the Unix epoch.
 pub type Millis = u64;
@@ -135,6 +135,7 @@ pub enum DeviceDetails {
     None,
     Ap(ApInfo),
     Ble(BleInfo),
+    BtClassic(BtClassicInfo),
     Lan(LanInfo),
 }
 
@@ -195,6 +196,13 @@ impl Device {
         }
     }
 
+    pub fn bt_classic(&self) -> Option<&BtClassicInfo> {
+        match &self.details {
+            DeviceDetails::BtClassic(b) => Some(b),
+            _ => None,
+        }
+    }
+
     pub fn lan(&self) -> Option<&LanInfo> {
         match &self.details {
             DeviceDetails::Lan(l) => Some(l),
@@ -210,6 +218,7 @@ impl Device {
         let fallback = match &self.details {
             DeviceDetails::Ap(a) => Some(a.display_ssid().to_owned()),
             DeviceDetails::Ble(b) => b.local_name.clone(),
+            DeviceDetails::BtClassic(b) => b.name.clone(),
             DeviceDetails::Lan(l) => l
                 .hostname
                 .clone()
