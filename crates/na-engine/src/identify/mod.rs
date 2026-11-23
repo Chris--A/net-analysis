@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub mod ble;
 mod bt_sig;
 mod classifier;
+pub mod fingerprint;
 mod lan;
 mod oui;
 mod wifi;

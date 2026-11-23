@@ -58,6 +58,39 @@ pub struct Banner {
     pub text: String,
 }
 
+/// What a host's DHCP client asks for. The parameter request list (option 55)
+/// and vendor class (option 60) differ between operating systems.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DhcpFingerprint {
+    /// Option 60, e.g. `MSFT 5.0`, `android-dhcp-14`, `dhcpcd-9.4.1:Linux…`.
+    pub vendor_class: Option<String>,
+    /// Option 55, in the order the client sent it.
+    pub prl: Vec<u8>,
+    /// Option 12.
+    pub hostname: Option<String>,
+}
+
+impl DhcpFingerprint {
+    /// `1,3,6,15,31,33,43,44,46,47,119,121,249,252`
+    pub fn prl_text(&self) -> String {
+        self.prl.iter().map(u8::to_string).collect::<Vec<_>>().join(",")
+    }
+}
+
+/// A TCP SYN's shape: initial TTL, window and option layout differ between OS stacks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpSignature {
+    /// TTL as received.
+    pub ttl: u8,
+    /// The likely initial TTL (32, 64, 128 or 255).
+    pub initial_ttl: u8,
+    pub window: u16,
+    pub mss: Option<u16>,
+    pub wscale: Option<u8>,
+    /// Option kinds in order, p0f-style: `M,N,W,N,N,T,S` (MSS, NOP, window scale, timestamp, SACK-permitted).
+    pub layout: String,
+}
+
 /// A host on the local network, merged from ARP, mDNS, SSDP, NetBIOS and probes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LanInfo {
@@ -73,6 +106,12 @@ pub struct LanInfo {
     pub banners: Vec<Banner>,
     /// Local interface the host was seen on, e.g. "Wi-Fi".
     pub interface: Option<String>,
+    /// From its DHCP requests (packet capture).
+    #[serde(default)]
+    pub dhcp: Option<DhcpFingerprint>,
+    /// From a TCP SYN it sent (packet capture).
+    #[serde(default)]
+    pub tcp: Option<TcpSignature>,
     pub is_gateway: bool,
     /// This machine.
     pub is_self: bool,
@@ -123,6 +162,12 @@ impl LanInfo {
         }
         if other.netbios.is_some() {
             self.netbios.clone_from(&other.netbios);
+        }
+        if other.dhcp.is_some() {
+            self.dhcp.clone_from(&other.dhcp);
+        }
+        if other.tcp.is_some() {
+            self.tcp.clone_from(&other.tcp);
         }
         self.is_gateway |= other.is_gateway;
         self.is_self |= other.is_self;

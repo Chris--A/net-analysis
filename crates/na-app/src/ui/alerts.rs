@@ -1,7 +1,7 @@
 //! Bottom panel: guard status, the alert timeline, the alert list and the event log.
 
 use bevy_egui::egui::{self, Color32, FontId, RichText, Sense, Stroke, vec2};
-use na_model::{Alert, EngineCommand, GuardStatus, KarmaOutcome, KarmaStatus, Severity, now_millis};
+use na_model::{Alert, DhcpCheckStatus, EngineCommand, GuardStatus, KarmaOutcome, KarmaStatus, Severity, now_millis};
 
 use super::ago;
 use super::theme::{ACCENT, DANGER, OK, WARN, WEAK};
@@ -66,7 +66,54 @@ fn guard_bar(ui: &mut egui::Ui, guard: Option<&GuardStatus>, link: Option<&Engin
         {
             link.send(EngineCommand::RunKarmaTest);
         }
+        ui.separator();
+        dhcp_label(ui, &g.dhcp);
+        let check = ui
+            .add_enabled(!g.dhcp.running, egui::Button::new("Check DHCP").small())
+            .on_hover_text(
+                "Sends one DHCP Discover (never followed by a Request, so no address is taken) and lists every \
+                 server that answers. More than one, or one handing out a different router, is a rogue DHCP server.",
+            );
+        if check.clicked()
+            && let Some(link) = link
+        {
+            link.send(EngineCommand::RunDhcpCheck);
+        }
+        if let Some((ip, mac)) = g.gateway {
+            ui.separator();
+            ui.label(RichText::new(format!("Gateway {ip}")).color(WEAK)).on_hover_text(format!("at {mac}"));
+        }
     });
+}
+
+fn dhcp_label(ui: &mut egui::Ui, d: &DhcpCheckStatus) {
+    let now = now_millis();
+    let (text, color, tip) = match (&d.last, d.running) {
+        (_, true) => ("DHCP check: listening…".to_owned(), ACCENT, String::new()),
+        (Some(r), _) => match (&r.error, r.servers.len()) {
+            (Some(e), _) => ("DHCP check: couldn't run".to_owned(), WARN, e.clone()),
+            (None, 0) => (
+                format!("DHCP check: no answer ({})", ago(now, r.at)),
+                WEAK,
+                "The Discover went out but no server answered, so this proves nothing either way.".to_owned(),
+            ),
+            (None, 1) => (
+                format!("DHCP check: 1 server ({})", ago(now, r.at)),
+                OK,
+                format!("{} at {}", r.servers[0].server, r.servers[0].mac),
+            ),
+            (None, n) => (
+                format!("DHCP check: {n} servers ({})", ago(now, r.at)),
+                DANGER,
+                r.servers.iter().map(|s| format!("{} at {}", s.server, s.mac)).collect::<Vec<_>>().join("\n"),
+            ),
+        },
+        (None, false) => ("DHCP check: not run yet".to_owned(), WEAK, "Needs packet capture (Npcap).".to_owned()),
+    };
+    let resp = ui.label(RichText::new(text).color(color));
+    if !tip.is_empty() {
+        resp.on_hover_text(tip);
+    }
 }
 
 fn karma_label(ui: &mut egui::Ui, k: &KarmaStatus) {
@@ -155,7 +202,8 @@ fn alerts(ui: &mut egui::Ui, reg: &Registry, sel: &mut Selection) {
             ui.label(
                 RichText::new(
                     "No alerts. The guard checks every access point against your trusted networks (evil twins, \
-                     security downgrades, missing 802.11w) and runs a periodic Karma test.",
+                     security downgrades, missing 802.11w), runs a periodic Karma test, and with packet capture \
+                     watches for ARP spoofing, gateway changes and rogue DHCP servers.",
                 )
                 .color(WEAK),
             );

@@ -6,20 +6,21 @@
 //! after `evil_twin_after`. The twin has an open network, a locally-administered BSSID,
 //! a fresh TSF uptime and a minimal IE set. A **Karma AP** (after `karma_ap_after`)
 //! rotates through several network names and answers the guard's decoy probes.
-//! All vendor prefixes are synthetic.
+//! An **ARP spoofer** (after `arp_spoof_after`) claims the gateway's address and
+//! runs a rogue DHCP server. All vendor prefixes are synthetic.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use na_model::{
     Akm, ApInfo, Band, Banner, BleAddressType, BtClassicInfo, Cipher, ClaimKind, DeviceDetails,
-    DeviceKey, Evidence, EvidenceSource as Src, LanInfo, MacAddr, MdnsService, NetbiosInfo,
-    Observation, Pmf, Security, SourceKind, UpnpInfo, WpsInfo, now_millis, stable_hash,
+    DeviceKey, DhcpFingerprint, DhcpServerSeen, Evidence, EvidenceSource as Src, LanInfo, MacAddr, MdnsService,
+    NetbiosInfo, Observation, Pmf, Security, SourceKind, UpnpInfo, WpsInfo, now_millis, stable_hash,
 };
 
 use super::ble::{BleSighting, classic_observation, observation as ble_observation};
 use super::{BoxFuture, Source, SourceCtx, SourceDeps};
-use crate::guard::GuardSignal;
+use crate::guard::{GuardSignal, NetEvent};
 use crate::identify::{BtDb, OuiDb, lan_evidence};
 
 #[derive(Clone, Debug)]
@@ -32,6 +33,8 @@ pub struct SimConfig {
     pub evil_twin_after: Option<Duration>,
     /// When the Karma AP appears (None disables it).
     pub karma_ap_after: Option<Duration>,
+    /// When a LAN host starts claiming the gateway's address and answering DHCP (None disables it).
+    pub arp_spoof_after: Option<Duration>,
 }
 
 impl Default for SimConfig {
@@ -42,6 +45,7 @@ impl Default for SimConfig {
             extra_devices: 0,
             evil_twin_after: Some(Duration::from_secs(20)),
             karma_ap_after: Some(Duration::from_secs(5)),
+            arp_spoof_after: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -68,9 +72,22 @@ impl Source for SimSource {
             let start = tokio::time::Instant::now();
             let mut tick = tokio::time::interval(self.cfg.tick);
             loop {
+                let net = |events: Vec<NetEvent>| {
+                    for e in events {
+                        let _ = self.deps.guard.send(GuardSignal::Net(e));
+                    }
+                };
                 let batch = tokio::select! {
                     _ = ctx.cancel.cancelled() => return Ok(()),
-                    _ = tick.tick() => world.step(start.elapsed()),
+                    _ = tick.tick() => {
+                        let obs = world.step(start.elapsed());
+                        net(world.net_events());
+                        obs
+                    }
+                    Ok(req) = self.deps.dhcp_probe.recv_async() => {
+                        net(world.dhcp_probe(req.xid));
+                        Vec::new()
+                    }
                     Ok(req) = self.deps.karma.recv_async() => {
                         let answers = world.karma_probe(&req.ssid);
                         let _ = self.deps.guard.send(GuardSignal::KarmaSent { ssid: req.ssid, result: Ok(()) });
@@ -175,6 +192,33 @@ pub(crate) struct SimWorld {
     rng: Rng,
     /// Seconds since start, as of the last step.
     t: f32,
+    steps: u64,
+    lan: SimLan,
+}
+
+/// The simulated LAN as packet capture would see it.
+struct SimLan {
+    gateway_mac: MacAddr,
+    pc_mac: MacAddr,
+    /// The ARP spoofer / rogue DHCP server, and when it starts.
+    attacker: Option<(MacAddr, f32)>,
+}
+
+const GW_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
+const ROGUE_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 66);
+
+fn home_gateway_mac() -> MacAddr {
+    sim_mac("NETGEAR", 0x12_3456).offset(-1)
+}
+
+fn pc_mac() -> MacAddr {
+    sim_mac("Intel", 0x0A_0B0C)
+}
+
+fn attacker_mac() -> MacAddr {
+    let mut m = sim_mac("rogue-laptop", 0x66_0066);
+    m.0[0] |= 0x02;
+    m
 }
 
 impl SimWorld {
@@ -187,7 +231,63 @@ impl SimWorld {
         build_bt_classic(&mut devices);
         build_rogues(&mut devices, cfg);
         build_extra(&mut devices, &mut rng, cfg.extra_devices, bt);
-        Self { devices, rng, t: 0.0 }
+        let lan = SimLan {
+            gateway_mac: home_gateway_mac(),
+            pc_mac: pc_mac(),
+            attacker: cfg.arp_spoof_after.map(|d| (attacker_mac(), d.as_secs_f32())),
+        };
+        Self { devices, rng, t: 0.0, steps: 0, lan }
+    }
+
+    fn attacker_active(&self) -> Option<MacAddr> {
+        self.lan.attacker.filter(|(_, after)| self.t >= *after).map(|(m, _)| m)
+    }
+
+    fn server(&self, rogue: bool) -> DhcpServerSeen {
+        if rogue {
+            let mac = self.lan.attacker.map(|(m, _)| m).unwrap_or_default();
+            DhcpServerSeen { server: ROGUE_IP, mac, routers: vec![ROGUE_IP], dns: vec![ROGUE_IP] }
+        } else {
+            DhcpServerSeen { server: GW_IP, mac: self.lan.gateway_mac, routers: vec![GW_IP], dns: vec![GW_IP] }
+        }
+    }
+
+    /// What capture would report this step: context, ARP claims, overheard DHCP offers.
+    pub(crate) fn net_events(&mut self) -> Vec<NetEvent> {
+        let at = now_millis();
+        let mut out = Vec::new();
+        if self.steps % 10 == 1 {
+            out.push(NetEvent::Context {
+                own_mac: Some(self.lan.pc_mac),
+                own_ip: Some(Ipv4Addr::new(192, 168, 1, 23)),
+                gateway: Some(GW_IP),
+                dns: vec![IpAddr::V4(GW_IP)],
+            });
+        }
+        out.push(NetEvent::Arp { ip: GW_IP, mac: self.lan.gateway_mac, at });
+        if let Some(evil) = self.attacker_active() {
+            out.push(NetEvent::Arp { ip: GW_IP, mac: evil, at });
+            out.push(NetEvent::Arp { ip: ROGUE_IP, mac: evil, at });
+            // Other devices' DHCP exchanges, overheard: the rogue answers them too.
+            if self.steps % 10 == 5 {
+                out.push(NetEvent::DhcpServer { seen: self.server(false), at });
+                out.push(NetEvent::DhcpServer { seen: self.server(true), at });
+            }
+        }
+        out
+    }
+
+    /// Answers to the rogue-DHCP check's Discover.
+    pub(crate) fn dhcp_probe(&self, xid: u32) -> Vec<NetEvent> {
+        let at = now_millis();
+        let mut out = vec![
+            NetEvent::DhcpProbeSent { xid, result: Ok(()) },
+            NetEvent::DhcpServer { seen: self.server(false), at },
+        ];
+        if self.attacker_active().is_some() {
+            out.push(NetEvent::DhcpServer { seen: self.server(true), at });
+        }
+        out
     }
 
     /// Karma APs that are present answer a directed probe for any name.
@@ -215,6 +315,7 @@ impl SimWorld {
         let now = now_millis();
         let t = elapsed.as_secs_f32();
         self.t = t;
+        self.steps += 1;
         let rng = &mut self.rng;
         let mut out = Vec::with_capacity(self.devices.len());
         for d in &mut self.devices {
@@ -444,6 +545,11 @@ fn build_home(out: &mut Vec<SimDevice>, cfg: &SimConfig) {
             ips: ip(23),
             hostname: Some("DESKTOP-NA01".into()),
             open_ports: vec![135, 139, 445],
+            dhcp: Some(DhcpFingerprint {
+                vendor_class: Some("MSFT 5.0".into()),
+                prl: vec![1, 3, 6, 15, 31, 33, 43, 44, 46, 47, 119, 121, 249, 252],
+                hostname: Some("DESKTOP-NA01".into()),
+            }),
             netbios: Some(NetbiosInfo { name: Some("DESKTOP-NA01".into()), group: Some("WORKGROUP".into()), file_server: true }),
             interface: wifi.clone(),
             is_self: true,
@@ -547,6 +653,11 @@ fn build_home(out: &mut Vec<SimDevice>, cfg: &SimConfig) {
         ips: ip(50),
         hostname: Some("Sams-iPhone".into()),
         open_ports: vec![62078],
+        dhcp: Some(DhcpFingerprint {
+            prl: vec![1, 121, 3, 6, 15, 108, 114, 119, 252, 95, 44, 46],
+            hostname: Some("Sams-iPhone".into()),
+            ..Default::default()
+        }),
         services: vec!["_apple-mobdev2._tcp".into(), "_companion-link._tcp".into()],
         mdns: vec![svc("Sam's iPhone", "_companion-link._tcp", 49_152, &["rpMd=iPhone15,2", "rpVr=620.21"])],
         interface: wifi.clone(),
@@ -583,6 +694,11 @@ fn build_home(out: &mut Vec<SimDevice>, cfg: &SimConfig) {
             ips: ip(70),
             hostname: Some("ESP_3A1F2C".into()),
             open_ports: vec![6668],
+            dhcp: Some(DhcpFingerprint {
+                vendor_class: Some("udhcp 1.31.1".into()),
+                prl: vec![1, 3, 6, 12, 15, 28, 42],
+                hostname: Some("ESP_3A1F2C".into()),
+            }),
             interface: wifi.clone(),
             ..Default::default()
         })
@@ -606,6 +722,11 @@ fn build_home(out: &mut Vec<SimDevice>, cfg: &SimConfig) {
             ips: ip(90),
             hostname: Some("raspberrypi".into()),
             open_ports: vec![22, 8123],
+            dhcp: Some(DhcpFingerprint {
+                vendor_class: Some("dhcpcd-9.4.1:Linux-6.6.31+rpt-rpi-v8:aarch64:BCM2835".into()),
+                prl: vec![1, 121, 33, 3, 6, 28, 51, 58, 59],
+                hostname: Some("raspberrypi".into()),
+            }),
             services: vec!["_home-assistant._tcp".into(), "_ssh._tcp".into()],
             mdns: vec![svc("Home", "_home-assistant._tcp", 8123, &["version=2026.11.1", "base_url=http://192.168.1.90:8123"])],
             banners: vec![banner(22, "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3")],
@@ -847,6 +968,10 @@ fn static_ble_address(rng: &mut Rng) -> MacAddr {
 /// A MANA-style rogue AP: open, locally-administered BSSID, cycling through
 /// common public network names, and answering probes for any name.
 fn build_rogues(out: &mut Vec<SimDevice>, cfg: &SimConfig) {
+    if let Some(after) = cfg.arp_spoof_after {
+        let d = lan(attacker_mac(), [192, 168, 1, 66], None, &[], &[]).presence(Presence::After(after.as_secs_f32()));
+        out.push(d);
+    }
     let Some(after) = cfg.karma_ap_after else { return };
     let s = after.as_secs_f32();
     let mut bssid = sim_mac("rogue-radio", 0x13_3700);
@@ -979,6 +1104,21 @@ mod tests {
         let answers = w.karma_probe("Lounge-123456");
         assert_eq!(answers.len(), 1);
         assert!(matches!(&answers[0].details, DeviceDetails::Ap(a) if a.ssid == "Lounge-123456"));
+    }
+
+    #[test]
+    fn arp_spoofer_claims_the_gateway_and_answers_dhcp() {
+        let cfg = SimConfig { arp_spoof_after: Some(Duration::from_secs(10)), ..Default::default() };
+        let mut w = SimWorld::new(&cfg, &BtDb::builtin());
+        w.step(Duration::from_secs(1));
+        let gateway_claims = |ev: &[NetEvent]| {
+            ev.iter().filter(|e| matches!(e, NetEvent::Arp { ip, .. } if *ip == GW_IP)).count()
+        };
+        assert_eq!(gateway_claims(&w.net_events()), 1);
+        assert_eq!(w.dhcp_probe(7).len(), 2, "sent + the real server");
+        w.step(Duration::from_secs(12));
+        assert_eq!(gateway_claims(&w.net_events()), 2, "the spoofer joins in");
+        assert_eq!(w.dhcp_probe(8).len(), 3, "and answers the Discover");
     }
 
     #[test]

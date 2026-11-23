@@ -123,7 +123,10 @@ fn device(
         }
         na_model::DeviceDetails::Ble(b) => ble_details(ui, b, bt),
         na_model::DeviceDetails::BtClassic(c) => classic_details(ui, c),
-        na_model::DeviceDetails::Lan(l) => lan_details(ui, l),
+        na_model::DeviceDetails::Lan(l) => {
+            lan_guard(ui, d, l, reg, link);
+            lan_details(ui, l);
+        }
         na_model::DeviceDetails::None => {}
     }
 
@@ -248,6 +251,44 @@ fn guard_section(
             }
         }
     });
+}
+
+/// For LAN hosts the guard flagged (ARP spoofing, rogue DHCP, gateway change), and
+/// for the gateway itself: the findings and, for a gateway change, a way to accept it.
+fn lan_guard(ui: &mut egui::Ui, d: &Device, l: &LanInfo, reg: &Registry, link: Option<&EngineLink>) {
+    let gateway = reg.guard.as_ref().and_then(|g| g.gateway);
+    let is_current_gateway = l.is_gateway || gateway.is_some_and(|(_, mac)| l.mac == Some(mac));
+    // Only a settled change can be accepted: never while two devices fight over the
+    // gateway (ARP spoofing) or a second DHCP server is answering.
+    let changed = reg
+        .alerts
+        .iter()
+        .rev()
+        .find(|a| a.devices.first() == Some(&d.id))
+        .is_some_and(|a| a.kind == na_model::AlertKind::GatewayChange)
+        && !d.risk_reasons.iter().any(|r| r.contains("ARP spoofing") || r.contains("DHCP server"));
+    if d.risk_reasons.is_empty() && !is_current_gateway {
+        return;
+    }
+    section(ui, "Guard");
+    if d.risk_reasons.is_empty() {
+        ui.label(RichText::new("The gateway matches what this network normally uses.").color(OK));
+        return;
+    }
+    if !changed {
+        ui.label(
+            RichText::new("Avoid signing in to anything on this network until this is explained.").color(WARN),
+        );
+    }
+    if changed {
+        let tip = "Use this if you replaced the router or changed its settings: the current gateway, DHCP \
+                   server and DNS become the network's normal.";
+        if ui.button("Accept current gateway").on_hover_text(tip).clicked()
+            && let Some(link) = link
+        {
+            link.send(EngineCommand::TrustGateway);
+        }
+    }
 }
 
 /// Trusting a flagged AP silences the guard for it, so ask first.
@@ -559,6 +600,25 @@ fn lan_details(ui: &mut egui::Ui, l: &LanInfo) {
             kv(ui, &format!("Banner :{}", b.port), RichText::new(&b.text).monospace().small());
         }
     });
+
+    if l.dhcp.is_some() || l.tcp.is_some() {
+        section(ui, "Packet fingerprints");
+        egui::Grid::new("fingerprints").num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+            if let Some(f) = &l.dhcp {
+                if let Some(vc) = &f.vendor_class {
+                    kv(ui, "DHCP vendor class", RichText::new(vc).monospace().small());
+                }
+                kv(ui, "DHCP request list", RichText::new(f.prl_text()).monospace().small());
+                if let Some(h) = &f.hostname {
+                    kv(ui, "DHCP host name", h.as_str());
+                }
+            }
+            if let Some(t) = &l.tcp {
+                kv(ui, "TCP SYN", RichText::new(format!("TTL {} (initial {}), window {}", t.ttl, t.initial_ttl, t.window)).monospace().small());
+                kv(ui, "TCP options", RichText::new(&t.layout).monospace().small());
+            }
+        });
+    }
 
     if let Some(u) = &l.upnp {
         section(ui, "UPnP / SSDP");

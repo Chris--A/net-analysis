@@ -22,11 +22,11 @@ pub use device::{
 };
 pub use events::{EngineCommand, EngineEvent, Observation, SourceKind, SourceState};
 pub use guard::{
-    ExpectedSecurity, GuardStatus, KarmaOutcome, KarmaResult, KarmaStatus, KnownBss, NetworkBaseline, SecurityClass,
-    TrustSource,
+    DhcpCheckResult, DhcpCheckStatus, DhcpServerSeen, ExpectedSecurity, GatewayBaseline, GuardStatus, KarmaOutcome,
+    KarmaResult, KarmaStatus, KnownBss, NetworkBaseline, SecurityClass, TrustSource,
 };
 pub use hash::stable_hash;
 pub use identity::{Claim, ClaimKind, Evidence, EvidenceSource, Identity};
-pub use lan::{Banner, LanInfo, MdnsService, NetbiosInfo, UpnpInfo};
+pub use lan::{Banner, DhcpFingerprint, LanInfo, MdnsService, NetbiosInfo, TcpSignature, UpnpInfo};
 pub use mac::{MacAddr, ParseMacError};
 pub use wifi::{Akm, ApInfo, Band, Cipher, Pmf, Security, WpsInfo};

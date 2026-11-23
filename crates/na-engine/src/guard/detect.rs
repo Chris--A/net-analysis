@@ -18,7 +18,7 @@ pub struct Finding {
 }
 
 impl Finding {
-    fn new(kind: AlertKind, severity: Severity, weight: f32, text: String) -> Self {
+    pub(crate) fn new(kind: AlertKind, severity: Severity, weight: f32, text: String) -> Self {
         Self { kind, severity: Some(severity), weight, text }
     }
 

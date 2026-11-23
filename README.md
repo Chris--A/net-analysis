@@ -15,8 +15,8 @@ Written in Rust: a headless engine plus a [Bevy](https://bevyengine.org) + egui 
 | **M2** | Bluetooth LE + Classic scanning, AD parser, vendor-protocol decoders | ✅ done |
 | **M3** | LAN discovery: ARP table, mDNS, SSDP/UPnP, NetBIOS, opt-in port/banner probes | ✅ done |
 | **M4** | Guard: trusted-network baselines, evil twin, downgrade, Karma, PMF, alerts | ✅ done |
-| M5 | Packet capture (Npcap/libpcap): DHCP/TCP fingerprints, ARP spoof, rogue DHCP | next |
-| M6 | Linux port (nl80211, BlueZ, rtnetlink), monitor-mode detectors | |
+| **M5** | Packet capture (Npcap/libpcap): DHCP/TCP fingerprints, ARP spoofing, gateway change, rogue DHCP | ✅ done |
+| M6 | Linux port (nl80211, BlueZ, rtnetlink), monitor-mode detectors | next |
 | M7 | Time scrubber, export, packaging, CI | |
 
 **Wi-Fi (M1).** Each AP is decoded from its beacon/probe information elements:
@@ -83,7 +83,27 @@ A locally-administered BSSID and a just-booted radio (TSF uptime) only *corrobor
 
 Each AP gets a risk score (noisy-OR of its findings) and its findings in plain language. Risky devices pulse red and wear a halo in every view. An alert fires once per device, and again only if it gets worse. The bottom panel shows the guard status, a timeline of alerts, and each alert's reasoning.
 
-**Simulator.** `--sim` replaces the real scanners with a synthetic world: a home mesh, neighbours, LAN hosts and BLE devices. After 20 s an **evil twin** of `HomeNet` appears (open, locally-administered BSSID, just-booted TSF). After 5 s a **Karma AP** starts cycling through public network names and answers the guard's decoy probes. A "SIMULATED DATA" badge shows while it runs.
+**Capture (M5).** With [Npcap](https://npcap.com) (Windows) or libpcap (Linux), the capture source reads what reaches this machine anyway: broadcast ARP and DHCP, and TCP connection attempts to it. The library is loaded at run time, so nothing extra is needed to build, and a machine without it shows the source as *unavailable*.
+- **Passive discovery**: every host that sends ARP appears, even with the LAN source off.
+- **OS fingerprints**: a DHCP client's vendor class and parameter request list (Windows, Android, iOS/macOS, Linux, BusyBox), and a TCP SYN's initial TTL, window and option order.
+- **LAN guard**, against the connected network's learned gateway (learned while connected with a password and nothing is wrong):
+
+| Detector | Severity |
+|---|---|
+| **ARP spoofing**: two devices claiming the gateway's address at the same time | Critical |
+| **Rogue DHCP**: a second DHCP server handing out a different router or DNS | High (Medium if its settings match) |
+| **Gateway change**: the gateway's MAC differs from the learned one, or from the one at the start of the session | High |
+| Another device claims **this computer's address** | High |
+| Address conflict between two other devices | Medium |
+| **DNS servers changed** on a trusted network | Medium |
+
+VRRP/HSRP virtual router MACs are allowed to share an address. Gateway changes are also caught from the OS's neighbor table, without capture.
+
+The **DHCP check** (every 10 minutes, or *Check DHCP*) sends one Discover and lists every server that offers an address. It never follows up with a Request, so no address is leased. The frame comes from this machine's MAC, but the DHCP client address is a random one: servers such as phone hotspots ignore a repeat Discover from a client that already holds a lease.
+
+If you replace your router, *Accept current gateway* in the gateway's inspector makes the new one normal. It isn't offered while two devices are fighting over the gateway.
+
+**Simulator.** `--sim` replaces the real scanners with a synthetic world: a home mesh, neighbours, LAN hosts and BLE devices. After 20 s an **evil twin** of `HomeNet` appears (open, locally-administered BSSID, just-booted TSF). After 5 s a **Karma AP** starts cycling through public network names and answers the guard's decoy probes. After 30 s an **ARP spoofer** claims the gateway's address and runs a rogue DHCP server. A "SIMULATED DATA" badge shows while it runs.
 
 ## Setup
 
@@ -102,6 +122,8 @@ sh scripts/fetch-data.sh        # Linux / macOS
 If any is off, the Wi-Fi source shows *unavailable* with this hint. It retries every few seconds, so scanning starts as soon as the switches are on.
 
 **Bluetooth** needs no permission or admin rights on Windows, just Bluetooth turned on. If it's off, the source shows *unavailable* and resumes when it comes back.
+
+**Packet capture** needs [Npcap](https://npcap.com). Leave *Restrict Npcap driver's access to Administrators only* unticked to capture without admin rights. On Linux, install libpcap and grant the binary `cap_net_raw,cap_net_admin`.
 
 **LAN discovery** needs no admin rights. Windows Firewall's default "allow unicast response to multicast" setting lets mDNS and SSDP replies through.
 
@@ -133,7 +155,10 @@ cargo run -p na-cli -- lan                        # LAN hosts (passive + standar
 cargo run -p na-cli -- lan --secs 30 --active     # + subnet sweep and port/banner probes (your networks only)
 cargo run -p na-platform --example net_probe      # interfaces, gateway, ARP table
 cargo run -p na-cli -- guard                      # trusted networks, Karma test, findings (20 s)
-cargo run -p na-cli -- guard --sim                # same against the simulated evil twin + Karma AP
+cargo run -p na-cli -- guard --sim                # same against the simulated evil twin, Karma AP, ARP spoofer
+cargo run -p na-cli -- capture                    # hosts seen by packet capture, with DHCP/TCP fingerprints
+cargo run -p na-platform --example cap_probe      # raw capture check: Npcap version, devices, packet counts
+cargo run -p na-engine --example dhcp_check       # send one DHCP Discover, print every DHCP packet seen
 cargo run -p na-cli -- sim --secs 5
 
 # Tests
@@ -159,19 +184,22 @@ crates/
     src/wifi/windows.rs        Native Wi-Fi API (wlanapi.dll)
     src/bluetooth/windows.rs   WinRT LE watcher + device enumeration, Win32 Classic inquiry
     src/net/                   interfaces/gateway (netdev), ARP table (GetIpNetTable2, /proc/net/arp), SMBIOS
+    src/capture.rs             pcap loaded at run time (Npcap wpcap.dll / libpcap.so)
   na-engine/     tokio engine on its own thread: sources → DeviceStore → identify → guard
     src/parse/ie.rs           802.11 information-element decoder + fingerprint
     src/parse/ble_ad.rs       BLE advertising-data decoder
     src/parse/{dns,upnp,netbios}.rs   mDNS/DNS-SD, SSDP + UPnP description + HTTP, NBSTAT
+    src/parse/{packet,dhcp}.rs        Ethernet/ARP/IPv4/UDP/TCP SYN, DHCP parse + Discover builder
     src/sources/wifi.rs       Wi-Fi source (blocking scan thread, permission retry)
     src/sources/ble.rs        Bluetooth source (advert merging, connected poll, Classic inquiry)
     src/sources/lan/          LAN source: host table, discovery rounds, opt-in sweep/probes
+    src/sources/capture.rs    capture source: ARP/DHCP/SYN → hosts, fingerprints, LAN guard events
     src/sources/sim.rs        synthetic world incl. evil-twin scenario
     src/identify/             OUI + Bluetooth SIG registries, AP and Bluetooth evidence
                               (Continuity, CDP, Fast Pair, appearance, CoD), LAN rules
                               (UPnP, TXT, services, banners, host names), noisy-OR classifier
     src/guard/                baselines (JSON + saved-profile import), AP detectors,
-                              Karma test, risk scores and alerts
+                              Karma test, LAN watch (ARP/gateway/DHCP/DNS), risk and alerts
   na-cli/        `na` binary: headless JSON/table output for testing
   na-app/        Bevy + egui frontend
     src/bridge.rs   engine events → Registry resource + one entity per device
@@ -191,5 +219,5 @@ scripts/         fetch-data.{ps1,sh}
 - **A perfect clone** (same BSSID, same security and capabilities) is indistinguishable from beacons alone. Packet capture (M5) and monitor mode (M6) add the gateway, DHCP, and deauth/sequence checks that can catch one.
 - **Bluetooth and Wi-Fi share an antenna** on most laptop cards. The default LE scan uses Windows' coexistence-friendly duty cycle. `--fast` and Classic inquiry briefly take airtime from Wi-Fi, so inquiry runs only every 90 s for 5 s.
 - **Classic discovery** finds only devices that are discoverable right now: pairing mode, or a Bluetooth settings page open. Phones and headphones in normal use don't answer.
-- **Packet capture**: needs [Npcap](https://npcap.com) on Windows, or libpcap with `cap_net_raw,cap_net_admin` on Linux.
+- **What capture can see**: on Wi-Fi (and switched Ethernet) only broadcasts and traffic to or from this machine. ARP spoofing aimed at *other* devices is visible only through its broadcasts; spoofing aimed at this machine always is.
 - **Monitor mode** (deauth/beacon-anomaly detection) is Linux-only in practice. Check support with `netsh wlan show wirelesscapabilities` on Windows or `iw list` on Linux. A VM can't use the host's PCIe Wi-Fi card, but a **USB Wi-Fi adapter can be passed through** to it (e.g. MT7921AU, MT7612U, AR9271).

@@ -79,5 +79,9 @@ pub enum EngineCommand {
     ForgetNetwork { ssid: String },
     /// Run the Karma test now: probe for a random network name and see who answers.
     RunKarmaTest,
+    /// Run the rogue-DHCP check now (needs packet capture).
+    RunDhcpCheck,
+    /// Accept the current gateway (and its DHCP/DNS settings) as normal for the connected network.
+    TrustGateway,
     Shutdown,
 }

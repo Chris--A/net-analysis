@@ -78,6 +78,18 @@ enum Cmd {
         /// Skip the Karma test (no probe for a decoy network name is sent).
         #[arg(long)]
         no_karma: bool,
+        /// Skip the rogue-DHCP check (no DHCP Discover is sent).
+        #[arg(long)]
+        no_dhcp: bool,
+    },
+    /// Capture ARP, DHCP and TCP SYNs (Npcap/libpcap) and show what each host revealed.
+    Capture {
+        /// How long to capture for.
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
     },
     /// Scan nearby Wi-Fi access points with this machine's adapter.
     Wifi {
@@ -147,15 +159,22 @@ fn main() -> Result<()> {
                 snapshot.print_lan_table();
             }
         }
-        Cmd::Guard { secs, json, sim, no_karma } => {
+        Cmd::Guard { secs, json, sim, no_karma, no_dhcp } => {
             let mut guard = if sim { GuardConfig::default() } else { GuardConfig::persistent() };
             guard.karma_interval = (!no_karma).then_some(Duration::from_secs(3600));
             guard.karma_first_after = Duration::from_secs(2);
+            guard.dhcp_interval = (!no_dhcp).then_some(Duration::from_secs(3600));
+            guard.dhcp_first_after = Duration::from_secs(4);
             let cfg = EngineConfig {
-                sources: vec![if sim { SourceKind::Sim } else { SourceKind::Wifi }],
+                sources: if sim {
+                    vec![SourceKind::Sim]
+                } else {
+                    vec![SourceKind::Wifi, SourceKind::Lan, SourceKind::Capture]
+                },
                 sim: SimConfig {
                     evil_twin_after: Some(Duration::from_secs(4)),
                     karma_ap_after: Some(Duration::from_secs(1)),
+                    arp_spoof_after: Some(Duration::from_secs(6)),
                     ..SimConfig::default()
                 },
                 guard,
@@ -166,6 +185,15 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&snapshot.to_json())?);
             } else {
                 snapshot.print_guard();
+            }
+        }
+        Cmd::Capture { secs, json } => {
+            let cfg = EngineConfig { sources: vec![SourceKind::Capture], ..EngineConfig::default() };
+            let snapshot = collect(cfg, Duration::from_secs(secs))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshot.to_json())?);
+            } else {
+                snapshot.print_capture_table();
             }
         }
         Cmd::Wifi { secs, json } => {
@@ -314,6 +342,40 @@ impl Snapshot {
             },
             None if g.karma.running => println!("Karma test: still listening (use a longer --secs)"),
             None => println!("Karma test: not run"),
+        }
+
+        match g.gateway {
+            Some((ip, mac)) => println!("Gateway: {ip} at {mac}"),
+            None => println!("Gateway: unknown"),
+        }
+        match (&g.dhcp.last, g.dhcp.running) {
+            (_, true) => println!("DHCP check: still listening"),
+            (Some(r), _) => match &r.error {
+                Some(e) => println!("DHCP check: couldn't run ({e})"),
+                None if r.servers.is_empty() => println!("DHCP check: Discover sent, no server answered"),
+                None => {
+                    let s: Vec<String> = r
+                        .servers
+                        .iter()
+                        .map(|s| {
+                            let routers: Vec<String> = s.routers.iter().map(ToString::to_string).collect();
+                            format!("{} ({}, router {})", s.server, s.mac, routers.join("/"))
+                        })
+                        .collect();
+                    println!("DHCP check: {} server(s): {}", s.len(), s.join("; "));
+                }
+            },
+            (None, false) => println!("DHCP check: not run"),
+        }
+        let lan: Vec<&Device> = self.sorted().into_iter().filter(|d| d.lan().is_some() && d.risk > 0.0).collect();
+        if !lan.is_empty() {
+            println!("\nLAN devices with findings:");
+            for d in lan {
+                println!("  {:>3.0}%  {:<24} {}", d.risk * 100.0, truncate(&d.display_name(), 24), d.key);
+                for r in &d.risk_reasons {
+                    println!("        - {r}");
+                }
+            }
         }
 
         let aps: Vec<&Device> = self.sorted().into_iter().filter(|d| d.ap().is_some()).collect();
@@ -499,6 +561,40 @@ impl Snapshot {
             );
         }
         println!("\n{} hosts  (* = randomized / private MAC)", self.devices.len());
+    }
+}
+
+impl Snapshot {
+    fn print_capture_table(&self) {
+        for (k, v) in &self.sources {
+            eprintln!("source {:<8} {v:?}", k.label());
+        }
+        println!("{:<18} {:<16} {:<34} {:<28} IDENTITY", "MAC", "IP", "DHCP (vendor class / request list)", "TCP SYN");
+        let mut n = 0;
+        for d in self.sorted() {
+            let Some(lan) = d.lan() else { continue };
+            n += 1;
+            let ip = lan.ips.first().map(ToString::to_string).unwrap_or_default();
+            let dhcp = lan.dhcp.as_ref().map_or(String::new(), |f| {
+                format!("{} [{}]", f.vendor_class.as_deref().unwrap_or("-"), f.prl_text())
+            });
+            let tcp = lan.tcp.as_ref().map_or(String::new(), |t| {
+                format!("ttl{} w{} {}", t.initial_ttl, t.window, t.layout)
+            });
+            let mut mac = d.key.to_string();
+            if lan.mac.is_some_and(|m| m.is_locally_administered()) {
+                mac.push('*');
+            }
+            println!(
+                "{:<18} {:<16} {:<34} {:<28} {}",
+                mac,
+                ip,
+                truncate(&dhcp, 34),
+                truncate(&tcp, 28),
+                d.identity.summary().unwrap_or_default()
+            );
+        }
+        println!("\n{n} hosts seen by capture  (* = randomized MAC)");
     }
 }
 

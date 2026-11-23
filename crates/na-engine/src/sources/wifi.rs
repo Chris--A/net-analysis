@@ -78,25 +78,34 @@ fn scan_loop(cfg: &WifiConfig, deps: &SourceDeps, ctx: &SourceCtx) -> anyhow::Re
 
     let mut last_scan: Option<Instant> = None;
     let mut blocked = false;
+    // A Karma probe waiting for the radio (the driver refuses scans while one is running).
+    let mut karma: Option<crate::guard::KarmaRequest> = None;
     // Last frame-receive time per BSSID, so a cached (not re-heard) entry isn't reported again.
     let mut last_rx: HashMap<MacAddr, Millis> = HashMap::new();
 
     while !ctx.cancel.is_cancelled() {
-        if last_scan.is_none_or(|t| t.elapsed() >= cfg.scan_interval) {
+        if karma.is_none() && last_scan.is_none_or(|t| t.elapsed() >= cfg.scan_interval) {
             if let Err(e) = scanner.trigger_scan(None) {
                 debug!(error = %e, "scan request failed");
             }
             last_scan = Some(Instant::now());
         }
 
-        // Karma test: a directed probe for the guard's decoy name.
+        // Karma test: a directed probe for the guard's decoy name. While the radio is
+        // busy (ERROR_BUSY) it waits for the next loop instead of failing the test.
         while let Ok(req) = deps.karma.try_recv() {
-            if req.is_stale(now_millis()) {
-                continue;
+            karma = Some(req);
+        }
+        if let Some(req) = karma.take() {
+            match scanner.trigger_scan(Some(req.ssid.as_bytes())) {
+                Err(WifiError::Os { code: 170, .. }) if !req.is_stale(now_millis()) => karma = Some(req),
+                result => {
+                    let result = result.map_err(|e| e.to_string());
+                    debug!(decoy = %req.ssid, ?result, "Karma probe");
+                    let _ = deps.guard.send(GuardSignal::KarmaSent { ssid: req.ssid, result });
+                    last_scan = Some(Instant::now()); // a directed scan is a scan too
+                }
             }
-            let result = scanner.trigger_scan(Some(req.ssid.as_bytes())).map_err(|e| e.to_string());
-            debug!(decoy = %req.ssid, ?result, "Karma probe");
-            let _ = deps.guard.send(GuardSignal::KarmaSent { ssid: req.ssid, result });
         }
 
         let connected: HashSet<MacAddr> = scanner

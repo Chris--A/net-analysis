@@ -129,6 +129,8 @@ impl DeviceKind {
     }
 }
 
+// One per device; boxing the larger variants would buy nothing measurable.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum DeviceDetails {
     #[default]

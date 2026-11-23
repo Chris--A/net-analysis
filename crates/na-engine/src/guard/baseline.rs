@@ -171,12 +171,24 @@ impl Baselines {
         }
     }
 
-    /// Forget the learned access points. A network that is still a saved
-    /// profile keeps its expected security.
+    /// Record the LAN side of a network. Returns true if it changed.
+    pub fn set_gateway(&mut self, ssid: &str, g: na_model::GatewayBaseline) -> bool {
+        let Some(n) = self.networks.get_mut(ssid) else { return false };
+        let same = n.gateway.as_ref().is_some_and(|old| old.ip == g.ip && old.mac == g.mac && old.dns == g.dns && old.dhcp_servers == g.dhcp_servers);
+        if !same {
+            n.gateway = Some(g);
+            self.dirty = true;
+        }
+        !same
+    }
+
+    /// Forget the learned access points and gateway. A network that is still a
+    /// saved profile keeps its expected security.
     pub fn forget(&mut self, ssid: &str) -> bool {
         let Some(n) = self.networks.get_mut(ssid) else { return false };
         if n.sources.contains(&TrustSource::SavedProfile) {
             n.known.clear();
+            n.gateway = None;
             n.sources = vec![TrustSource::SavedProfile];
         } else {
             self.networks.remove(ssid);

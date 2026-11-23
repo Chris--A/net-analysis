@@ -149,6 +149,8 @@ fn start_engine(mut commands: Commands, opts: Res<LaunchOptions>) {
             GuardConfig {
                 karma_first_after: Duration::from_secs(8),
                 karma_interval: Some(Duration::from_secs(300)),
+                dhcp_first_after: Duration::from_secs(10),
+                dhcp_interval: Some(Duration::from_secs(300)),
                 ..GuardConfig::default()
             }
         } else {

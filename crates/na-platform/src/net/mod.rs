@@ -60,6 +60,8 @@ impl Ipv4Cidr {
 #[derive(Clone, Debug)]
 pub struct LocalInterface {
     pub index: u32,
+    /// OS identifier: the adapter GUID on Windows, the ifname on Linux.
+    pub id: String,
     /// Human-readable name ("Wi-Fi", "eth0").
     pub name: String,
     pub description: Option<String>,
@@ -84,6 +86,7 @@ pub fn interfaces() -> Vec<LocalInterface> {
             let gw = i.gateway.as_ref();
             LocalInterface {
                 index: i.index,
+                id: i.name.clone(),
                 name: i.friendly_name.clone().unwrap_or_else(|| i.name.clone()),
                 description: i.description.clone(),
                 kind: match i.if_type {

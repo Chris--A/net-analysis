@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::guard::{Guard, GuardConfig, GuardSignal};
 use crate::identify::{BtDb, OuiDb};
 use crate::sources::{self, ObservationSink, SourceCtx, SourceDeps};
-use crate::{BleConfig, DeviceStore, LanConfig, SimConfig, WifiConfig};
+use crate::{BleConfig, CaptureConfig, DeviceStore, LanConfig, SimConfig, WifiConfig};
 
 /// How long each device class may go unseen before it is dropped.
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +42,7 @@ pub struct EngineConfig {
     pub wifi: WifiConfig,
     pub ble: BleConfig,
     pub lan: LanConfig,
+    pub capture: CaptureConfig,
     pub guard: GuardConfig,
     /// How often changed devices are pushed to the frontend.
     pub flush_interval: Duration,
@@ -56,6 +57,7 @@ impl Default for EngineConfig {
             wifi: WifiConfig::default(),
             ble: BleConfig::default(),
             lan: LanConfig::default(),
+            capture: CaptureConfig::default(),
             guard: GuardConfig::default(),
             flush_interval: Duration::from_millis(200),
             stale: StalePolicy::default(),
@@ -64,9 +66,10 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
-    /// Real scanners available on this platform (simulator excluded).
+    /// Real scanners (simulator excluded). Capture reports itself unavailable
+    /// when Npcap/libpcap is missing.
     pub fn real_sources() -> Vec<SourceKind> {
-        vec![SourceKind::Wifi, SourceKind::Ble, SourceKind::Lan]
+        vec![SourceKind::Wifi, SourceKind::Ble, SourceKind::Lan, SourceKind::Capture]
     }
 }
 
@@ -149,7 +152,8 @@ async fn run(
     let (lan_active, lan_active_rx) = tokio::sync::watch::channel(cfg.lan.active);
     let (karma_tx, karma_rx) = flume::bounded(4);
     let (guard_tx, guard_rx) = flume::unbounded();
-    let mut guard = Guard::new(&cfg.guard, karma_tx, now_millis());
+    let (dhcp_tx, dhcp_rx) = flume::bounded(4);
+    let mut guard = Guard::new(&cfg.guard, karma_tx, dhcp_tx, now_millis());
     if cfg.guard.import_saved_profiles {
         let tx = guard_tx.clone();
         tokio::task::spawn_blocking(move || {
@@ -167,6 +171,7 @@ async fn run(
             lan_active: lan_active_rx,
             karma: karma_rx,
             guard: guard_tx,
+            dhcp_probe: dhcp_rx,
         },
         obs_tx: &obs_tx,
         evt_tx: &evt_tx,
@@ -204,10 +209,10 @@ async fn run(
                 }
                 Ok(EngineCommand::Shutdown) | Err(_) => break,
                 Ok(other) => {
-                    let radio = radio_running(&running);
-                    if guard.command(&other, &store, now_millis(), radio) {
+                    let (radio, capture) = (radio_running(&running), capture_running(&running));
+                    if guard.command(&other, &store, now_millis(), radio, capture) {
                         // Show the effect (risk, trust status) right away.
-                        if !send_all(&evt_tx, guard.tick(&mut store, now_millis(), radio)) { break; }
+                        if !send_all(&evt_tx, guard.tick(&mut store, now_millis(), radio, capture)) { break; }
                     }
                 }
             },
@@ -218,7 +223,8 @@ async fn run(
                 running.retain(|_, r| !r.task.is_finished());
                 let now = now_millis();
                 if !send_all(&evt_tx, store.sweep_stale(now)) { break; }
-                if !send_all(&evt_tx, guard.tick(&mut store, now, radio_running(&running))) { break; }
+                let events = guard.tick(&mut store, now, radio_running(&running), capture_running(&running));
+                if !send_all(&evt_tx, events) { break; }
             }
         }
     }
@@ -234,6 +240,13 @@ async fn run(
 /// A source that can send Karma probes is up.
 fn radio_running(running: &HashMap<SourceKind, RunningSource>) -> bool {
     [SourceKind::Wifi, SourceKind::Sim]
+        .iter()
+        .any(|k| running.get(k).is_some_and(|r| !r.task.is_finished()))
+}
+
+/// A source that can send the rogue-DHCP check is up.
+fn capture_running(running: &HashMap<SourceKind, RunningSource>) -> bool {
+    [SourceKind::Capture, SourceKind::Sim]
         .iter()
         .any(|k| running.get(k).is_some_and(|r| !r.task.is_finished()))
 }
@@ -316,22 +329,6 @@ mod tests {
         }
         assert!(saw_running);
         assert!(upserts >= 20, "only got {upserts} upserts");
-
-        // Unimplemented sources report themselves as unavailable instead of failing silently.
-        handle.send(EngineCommand::SetSourceEnabled {
-            source: SourceKind::Capture,
-            enabled: true,
-        });
-        let unavailable = handle.events().iter().take(500).any(|e| {
-            matches!(
-                e,
-                EngineEvent::SourceStatus {
-                    source: SourceKind::Capture,
-                    state: SourceState::Unavailable(_)
-                }
-            )
-        });
-        assert!(unavailable);
         drop(handle); // must join cleanly
     }
 }

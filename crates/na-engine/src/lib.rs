@@ -13,6 +13,7 @@ pub use engine::{Engine, EngineConfig, EngineHandle, StalePolicy};
 pub use guard::GuardConfig;
 pub use identify::{BtDb, OuiDb};
 pub use sources::ble::BleConfig;
+pub use sources::capture::CaptureConfig;
 pub use sources::lan::LanConfig;
 pub use sources::sim::SimConfig;
 pub use sources::wifi::WifiConfig;

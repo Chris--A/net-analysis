@@ -1,6 +1,8 @@
 //! Guard state shared with the frontend: trusted-network baselines and the
 //! Karma test status.
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{Akm, Band, MacAddr, Millis, Security};
@@ -93,6 +95,17 @@ pub struct KnownBss {
     pub last_seen: Millis,
 }
 
+/// The LAN side of a trusted network, learned while connected to it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayBaseline {
+    pub ip: Ipv4Addr,
+    pub mac: MacAddr,
+    pub dns: Vec<IpAddr>,
+    /// DHCP server identifiers seen answering on this network.
+    pub dhcp_servers: Vec<Ipv4Addr>,
+    pub learned: Millis,
+}
+
 /// What "normal" looks like for one network name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NetworkBaseline {
@@ -101,12 +114,14 @@ pub struct NetworkBaseline {
     /// From a saved profile, when there is one.
     pub expected: Option<ExpectedSecurity>,
     pub known: Vec<KnownBss>,
+    #[serde(default)]
+    pub gateway: Option<GatewayBaseline>,
     pub created: Millis,
 }
 
 impl NetworkBaseline {
     pub fn new(ssid: impl Into<String>, at: Millis) -> Self {
-        Self { ssid: ssid.into(), sources: Vec::new(), expected: None, known: Vec::new(), created: at }
+        Self { ssid: ssid.into(), sources: Vec::new(), expected: None, known: Vec::new(), gateway: None, created: at }
     }
 
     pub fn find(&self, bssid: MacAddr) -> Option<&KnownBss> {
@@ -155,12 +170,44 @@ pub struct KarmaStatus {
     pub next_at: Option<Millis>,
 }
 
+/// One DHCP server that answered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DhcpServerSeen {
+    /// Server identifier (option 54), or the source address.
+    pub server: Ipv4Addr,
+    pub mac: MacAddr,
+    pub routers: Vec<Ipv4Addr>,
+    pub dns: Vec<Ipv4Addr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DhcpCheckResult {
+    pub at: Millis,
+    pub servers: Vec<DhcpServerSeen>,
+    /// The Discover couldn't be sent, so an empty list proves nothing.
+    pub error: Option<String>,
+}
+
+/// The rogue-DHCP check: one DHCP Discover (never followed by a Request), then
+/// count who offers an address.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DhcpCheckStatus {
+    pub running: bool,
+    pub last: Option<DhcpCheckResult>,
+    pub next_at: Option<Millis>,
+}
+
 /// Snapshot of the guard, sent to the frontend whenever it changes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GuardStatus {
     /// Sorted by SSID.
     pub networks: Vec<NetworkBaseline>,
     pub karma: KarmaStatus,
+    #[serde(default)]
+    pub dhcp: DhcpCheckStatus,
+    /// The gateway this machine uses right now, as (IP, MAC).
+    #[serde(default)]
+    pub gateway: Option<(Ipv4Addr, MacAddr)>,
     /// Outcome of importing the OS's saved Wi-Fi profiles, for display.
     pub profile_import: Option<String>,
 }

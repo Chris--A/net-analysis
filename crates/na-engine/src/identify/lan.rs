@@ -91,6 +91,12 @@ pub fn lan_evidence(info: &LanInfo, oui: &OuiDb) -> Vec<Evidence> {
     for b in &info.banners {
         banner_evidence(b.port, &b.text, &mut out);
     }
+    if let Some(fp) = &info.dhcp {
+        out.0.extend(super::fingerprint::dhcp_evidence(fp));
+    }
+    if let Some(sig) = &info.tcp {
+        out.0.extend(super::fingerprint::tcp_evidence(sig));
+    }
     out.0
 }
 

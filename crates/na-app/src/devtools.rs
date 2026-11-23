@@ -177,6 +177,18 @@ fn run_tour(
         }
         16 => {
             ui_state.confirm_trust = None;
+            // The ARP spoofer: the riskiest LAN host, shown in the LAN-centric view.
+            sel.selected = reg
+                .devices
+                .values()
+                .filter(|d| d.kind == DeviceKind::LanHost && d.risk > 0.0)
+                .max_by(|a, b| a.risk.total_cmp(&b.risk))
+                .map(|d| d.id);
+            next_view.set(ViewMode::Constellation);
+            (4.0, false)
+        }
+        17 => {
+            shot(&mut commands, &dir, "11-arp-spoof-selected.png");
             (0.5, false)
         }
         _ => (0.0, true),

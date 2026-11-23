@@ -9,10 +9,11 @@ use na_model::{EngineEvent, Observation, SourceKind, SourceState};
 use tokio_util::sync::CancellationToken;
 
 use crate::EngineConfig;
-use crate::guard::{GuardSignal, KarmaRequest};
+use crate::guard::{DhcpProbeRequest, GuardSignal, KarmaRequest};
 use crate::identify::{BtDb, OuiDb};
 
 pub mod ble;
+pub mod capture;
 pub mod lan;
 pub mod sim;
 pub mod wifi;
@@ -67,6 +68,8 @@ pub struct SourceDeps {
     pub karma: flume::Receiver<KarmaRequest>,
     /// Reports back to the guard.
     pub guard: flume::Sender<GuardSignal>,
+    /// Rogue-DHCP check Discovers for the capture source (or simulator).
+    pub dhcp_probe: flume::Receiver<DhcpProbeRequest>,
 }
 
 pub trait Source: Send + 'static {
@@ -87,6 +90,6 @@ pub fn make_source(
         SourceKind::Wifi => Ok(Box::new(wifi::WifiSource::new(cfg.wifi.clone(), deps.clone()))),
         SourceKind::Ble => Ok(Box::new(ble::BleSource::new(cfg.ble.clone(), deps.oui.clone(), deps.bt.clone()))),
         SourceKind::Lan => Ok(Box::new(lan::LanSource::new(cfg.lan.clone(), deps.oui.clone(), deps.lan_active.clone()))),
-        SourceKind::Capture => Err("not implemented yet (milestone M5)".into()),
+        SourceKind::Capture => Ok(Box::new(capture::CaptureSource::new(cfg.capture.clone(), deps.clone()))),
     }
 }
