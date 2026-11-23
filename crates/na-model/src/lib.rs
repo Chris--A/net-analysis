@@ -22,6 +22,6 @@ pub use device::{
 pub use events::{EngineCommand, EngineEvent, Observation, SourceKind, SourceState};
 pub use hash::stable_hash;
 pub use identity::{Claim, ClaimKind, Evidence, EvidenceSource, Identity};
-pub use lan::LanInfo;
+pub use lan::{Banner, LanInfo, MdnsService, NetbiosInfo, UpnpInfo};
 pub use mac::{MacAddr, ParseMacError};
 pub use wifi::{Akm, ApInfo, Band, Cipher, Pmf, Security, WpsInfo};

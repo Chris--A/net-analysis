@@ -12,14 +12,14 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use na_model::{
-    Akm, ApInfo, Band, BleAddressType, BtClassicInfo, Cipher, ClaimKind, DeviceDetails, DeviceKey,
-    Evidence, EvidenceSource as Src, LanInfo, MacAddr, Observation, Pmf, Security, SourceKind,
-    WpsInfo, now_millis, stable_hash,
+    Akm, ApInfo, Band, Banner, BleAddressType, BtClassicInfo, Cipher, ClaimKind, DeviceDetails,
+    DeviceKey, Evidence, EvidenceSource as Src, LanInfo, MacAddr, MdnsService, NetbiosInfo,
+    Observation, Pmf, Security, SourceKind, UpnpInfo, WpsInfo, now_millis, stable_hash,
 };
 
 use super::ble::{BleSighting, classic_observation, observation as ble_observation};
 use super::{BoxFuture, Source, SourceCtx};
-use crate::identify::{BtDb, OuiDb};
+use crate::identify::{BtDb, OuiDb, lan_evidence};
 
 #[derive(Clone, Debug)]
 pub struct SimConfig {
@@ -293,17 +293,9 @@ fn lan(mac: MacAddr, ip: [u8; 4], hostname: Option<&str>, ports: &[u16], service
         hostname: hostname.map(Into::into),
         open_ports: ports.to_vec(),
         services: services.iter().map(|s| (*s).to_owned()).collect(),
-        is_gateway: false,
-        is_self: false,
+        ..Default::default()
     };
     SimDevice::new(DeviceKey::LanMac(mac), DeviceDetails::Lan(info), None)
-}
-
-fn edit_lan(mut d: SimDevice, f: impl FnOnce(&mut LanInfo)) -> SimDevice {
-    if let DeviceDetails::Lan(l) = &mut d.details {
-        f(l);
-    }
-    d
 }
 
 fn build_home(out: &mut Vec<SimDevice>, cfg: &SimConfig) {
@@ -355,15 +347,49 @@ fn build_home(out: &mut Vec<SimDevice>, cfg: &SimConfig) {
     }
 
     // --- LAN ---
+    // Hosts describe themselves the way real ones do (UPnP, mDNS TXT, NetBIOS,
+    // banners). Identification runs through the same rules as live discovery. The
+    // synthetic MAC prefixes aren't in the OUI registry, so their vendor votes are added by hand.
     let home_aps = [main, radio24, satellite];
-    let mut gw = edit_lan(
-        lan(gateway, [192, 168, 1, 1], Some("router.lan"), &[53, 80, 443], &["_http._tcp"]),
-        |l| l.is_gateway = true,
-    )
-    .ev(Src::Oui, ClaimKind::Vendor, vendor, 0.6, &oui_detail(gateway, vendor))
-    .ev(Src::Ssdp, ClaimKind::DeviceType, "Router", 0.8, "UPnP urn:schemas-upnp-org:device:InternetGatewayDevice:1")
-    .ev(Src::Heuristic, ClaimKind::Model, "RAX50", 0.5, "LAN MAC is BSSID−1 of 'HomeNet' AP whose WPS model is RAX50")
-    .ev(Src::Banner, ClaimKind::Vendor, "NETGEAR", 0.4, "HTTP Server: NETGEAR");
+    let oui = OuiDb::default();
+    let host = |info: LanInfo| {
+        let mac = info.mac.expect("sim LAN hosts have a MAC");
+        let evidence = lan_evidence(&info, &oui);
+        let mut d = SimDevice::new(DeviceKey::LanMac(mac), DeviceDetails::Lan(info), None);
+        d.evidence = evidence;
+        d
+    };
+    let ip = |last: u8| vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, last))];
+    let svc = |instance: &str, service: &str, port: u16, txt: &[&str]| MdnsService {
+        instance: instance.into(),
+        service: service.into(),
+        port: Some(port),
+        txt: txt.iter().map(|t| (*t).to_owned()).collect(),
+    };
+    let banner = |port: u16, text: &str| Banner { port, text: text.into() };
+    let wifi = Some("Wi-Fi".to_owned());
+
+    let mut gw = host(LanInfo {
+        mac: Some(gateway),
+        ips: ip(1),
+        hostname: Some("routerlogin".into()),
+        open_ports: vec![53, 80, 443],
+        upnp: Some(UpnpInfo {
+            friendly_name: Some("NETGEAR RAX50".into()),
+            manufacturer: Some("NETGEAR".into()),
+            model_name: Some("RAX50".into()),
+            model_number: Some("RAX50".into()),
+            model_description: Some("NETGEAR Nighthawk AX6 WiFi Router".into()),
+            device_type: Some("urn:schemas-upnp-org:device:InternetGatewayDevice:1".into()),
+            server: Some("Linux/4.1.52 UPnP/1.0 MiniUPnPd/2.1".into()),
+            advertised: vec!["upnp:rootdevice".into(), "urn:schemas-upnp-org:device:InternetGatewayDevice:1".into()],
+        }),
+        banners: vec![banner(80, "Server: lighttpd/1.4.59 · title: NETGEAR Router RAX50")],
+        interface: wifi.clone(),
+        is_gateway: true,
+        ..Default::default()
+    })
+    .ev(Src::Oui, ClaimKind::Vendor, vendor, 0.6, &oui_detail(gateway, vendor));
     for b in home_aps {
         gw = gw.link(DeviceKey::Bssid(b));
     }
@@ -371,95 +397,193 @@ fn build_home(out: &mut Vec<SimDevice>, cfg: &SimConfig) {
 
     let pc = sim_mac("Intel", 0x0A_0B0C);
     out.push(
-        edit_lan(lan(pc, [192, 168, 1, 23], Some("DESKTOP-NA01"), &[135, 139, 445], &[]), |l| {
-            l.is_self = true
+        host(LanInfo {
+            mac: Some(pc),
+            ips: ip(23),
+            hostname: Some("DESKTOP-NA01".into()),
+            open_ports: vec![135, 139, 445],
+            netbios: Some(NetbiosInfo { name: Some("DESKTOP-NA01".into()), group: Some("WORKGROUP".into()), file_server: true }),
+            interface: wifi.clone(),
+            is_self: true,
+            ..Default::default()
         })
-        .ev(Src::NetBios, ClaimKind::Name, "DESKTOP-NA01", 0.9, "NBSTAT name DESKTOP-NA01<00>")
-        .ev(Src::Oui, ClaimKind::Vendor, "Intel", 0.4, &oui_detail(pc, "Intel (NIC)"))
-        .ev(Src::Banner, ClaimKind::Os, "Windows", 0.7, "MSRPC on 135, SMB 3.1.1 on 445")
-        .ev(Src::Heuristic, ClaimKind::DeviceType, "PC", 0.6, "This machine"),
+        .ev(Src::Oui, ClaimKind::Vendor, "Intel", 0.4, &oui_detail(pc, "Intel (NIC)")),
     );
 
     let nas = sim_mac("Synology", 0x00_0001);
     out.push(
-        lan(nas, [192, 168, 1, 10], Some("nas"), &[22, 80, 443, 445, 5000, 5001], &["_smb._tcp", "_http._tcp", "_afpovertcp._tcp"])
-            .ev(Src::Oui, ClaimKind::Vendor, "Synology", 0.6, &oui_detail(nas, "Synology"))
-            .ev(Src::Ssdp, ClaimKind::Vendor, "Synology", 0.8, "UPnP manufacturer = Synology")
-            .ev(Src::Ssdp, ClaimKind::Model, "DS920+", 0.85, "UPnP modelName = DS920+")
-            .ev(Src::Mdns, ClaimKind::DeviceType, "NAS", 0.7, "_afpovertcp._tcp + _smb._tcp")
-            .ev(Src::Banner, ClaimKind::Os, "Synology DSM 7", 0.6, "HTTP :5000 title 'Synology DiskStation'"),
+        host(LanInfo {
+            mac: Some(nas),
+            ips: ip(10),
+            hostname: Some("nas".into()),
+            open_ports: vec![22, 80, 443, 445, 5000, 5001],
+            services: vec!["_smb._tcp".into(), "_afpovertcp._tcp".into(), "_http._tcp".into()],
+            mdns: vec![svc("nas", "_smb._tcp", 445, &[]), svc("nas", "_http._tcp", 5000, &["vendor=Synology", "model=DS920+"])],
+            upnp: Some(UpnpInfo {
+                friendly_name: Some("nas (DS920+)".into()),
+                manufacturer: Some("Synology".into()),
+                model_name: Some("DS920+".into()),
+                device_type: Some("urn:schemas-upnp-org:device:Basic:1".into()),
+                server: Some("Synology/DSM/192.168.1.10".into()),
+                ..Default::default()
+            }),
+            banners: vec![
+                banner(22, "SSH-2.0-OpenSSH_8.2"),
+                banner(5000, "Server: nginx · title: Synology DiskStation - nas"),
+            ],
+            netbios: Some(NetbiosInfo { name: Some("NAS".into()), group: Some("WORKGROUP".into()), file_server: true }),
+            interface: wifi.clone(),
+            ..Default::default()
+        })
+        .ev(Src::Oui, ClaimKind::Vendor, "Synology", 0.6, &oui_detail(nas, "Synology")),
     );
 
     let cast = sim_mac("Google", 0x31_0031);
     out.push(
-        lan(cast, [192, 168, 1, 31], None, &[8008, 8009, 8443], &["_googlecast._tcp"])
-            .ev(Src::Oui, ClaimKind::Vendor, "Google", 0.6, &oui_detail(cast, "Google"))
-            .ev(Src::Mdns, ClaimKind::Name, "Living Room TV", 0.9, "TXT fn=Living Room TV")
-            .ev(Src::Mdns, ClaimKind::DeviceType, "Media streamer", 0.8, "_googlecast._tcp")
-            .ev(Src::Mdns, ClaimKind::Model, "Chromecast with Google TV", 0.85, "TXT md=Chromecast"),
+        host(LanInfo {
+            mac: Some(cast),
+            ips: ip(31),
+            open_ports: vec![8008, 8009, 8443],
+            services: vec!["_googlecast._tcp".into()],
+            mdns: vec![svc(
+                "Chromecast-6d8e2f1a",
+                "_googlecast._tcp",
+                8009,
+                &["id=6d8e2f1a", "md=Chromecast with Google TV", "fn=Living Room TV", "ve=05", "ca=463365"],
+            )],
+            interface: wifi.clone(),
+            ..Default::default()
+        })
+        .ev(Src::Oui, ClaimKind::Vendor, "Google", 0.6, &oui_detail(cast, "Google")),
     );
 
     let tv = sim_mac("LG Electronics", 0x32_0032);
-    out.push(
-        lan(tv, [192, 168, 1, 32], None, &[3000, 3001], &["_airplay._tcp"])
-            .ev(Src::Ssdp, ClaimKind::Vendor, "LG Electronics", 0.8, "UPnP manufacturer = LG Electronics")
-            .ev(Src::Ssdp, ClaimKind::Model, "OLED55C2", 0.8, "UPnP modelName = OLED55C2")
-            .ev(Src::Ssdp, ClaimKind::DeviceType, "TV", 0.8, "UPnP MediaRenderer:1, webOS user agent")
-            .ev(Src::Ssdp, ClaimKind::Os, "webOS", 0.7, "SERVER: WebOS/6.0 UPnP/1.0"),
-    );
+    out.push(host(LanInfo {
+        mac: Some(tv),
+        ips: ip(32),
+        hostname: Some("LGwebOSTV".into()),
+        open_ports: vec![3000, 3001],
+        services: vec!["_airplay._tcp".into()],
+        mdns: vec![svc("[LG] webOS TV OLED55C2", "_airplay._tcp", 7000, &["manufacturer=LG Electronics", "model=OLED55C2PUA"])],
+        upnp: Some(UpnpInfo {
+            friendly_name: Some("[LG] webOS TV OLED55C2".into()),
+            manufacturer: Some("LG Electronics".into()),
+            model_name: Some("OLED55C2PUA".into()),
+            device_type: Some("urn:schemas-upnp-org:device:MediaRenderer:1".into()),
+            server: Some("WebOS/6.0 UPnP/1.0".into()),
+            advertised: vec!["urn:dial-multiscreen-org:service:dial:1".into()],
+            ..Default::default()
+        }),
+        interface: wifi.clone(),
+        ..Default::default()
+    }));
 
     let printer = sim_mac("HP", 0x40_0040);
     out.push(
-        lan(printer, [192, 168, 1, 40], Some("HP4A2B1C"), &[80, 443, 631, 9100], &["_ipp._tcp", "_pdl-datastream._tcp"])
-            .ev(Src::Oui, ClaimKind::Vendor, "HP", 0.6, &oui_detail(printer, "HP"))
-            .ev(Src::Mdns, ClaimKind::DeviceType, "Printer", 0.9, "_ipp._tcp")
-            .ev(Src::Mdns, ClaimKind::Model, "OfficeJet Pro 9015", 0.85, "TXT ty=HP OfficeJet Pro 9015"),
+        host(LanInfo {
+            mac: Some(printer),
+            ips: ip(40),
+            hostname: Some("HP4A2B1C".into()),
+            open_ports: vec![80, 443, 631, 9100],
+            services: vec!["_ipp._tcp".into(), "_pdl-datastream._tcp".into(), "_uscan._tcp".into()],
+            mdns: vec![svc(
+                "HP OfficeJet Pro 9015 [4A2B1C]",
+                "_ipp._tcp",
+                631,
+                &["ty=HP OfficeJet Pro 9015", "usb_MFG=HP", "usb_MDL=OfficeJet Pro 9015", "product=(HP OfficeJet Pro 9015)"],
+            )],
+            interface: wifi.clone(),
+            ..Default::default()
+        })
+        .ev(Src::Oui, ClaimKind::Vendor, "HP", 0.6, &oui_detail(printer, "HP")),
     );
 
     let mut iphone = sim_mac("phone-random", 0x50_0050);
     iphone.0[0] |= 0x02; // private Wi-Fi address
-    out.push(
-        lan(iphone, [192, 168, 1, 50], Some("iPhone"), &[62078], &["_apple-mobdev2._tcp"])
-            .ev(Src::Banner, ClaimKind::DeviceType, "Phone", 0.7, "TCP 62078 (lockdownd) open")
-            .ev(Src::Mdns, ClaimKind::Vendor, "Apple", 0.6, "_apple-mobdev2._tcp")
-            .ev(Src::Mdns, ClaimKind::Os, "iOS", 0.7, "_apple-mobdev2._tcp"),
-    );
+    out.push(host(LanInfo {
+        mac: Some(iphone),
+        ips: ip(50),
+        hostname: Some("Sams-iPhone".into()),
+        open_ports: vec![62078],
+        services: vec!["_apple-mobdev2._tcp".into(), "_companion-link._tcp".into()],
+        mdns: vec![svc("Sam's iPhone", "_companion-link._tcp", 49_152, &["rpMd=iPhone15,2", "rpVr=620.21"])],
+        interface: wifi.clone(),
+        ..Default::default()
+    }));
 
     let hue = sim_mac("Signify", 0x60_0060);
     out.push(
-        lan(hue, [192, 168, 1, 60], Some("Philips-hue"), &[80, 443], &["_hue._tcp"])
-            .ev(Src::Oui, ClaimKind::Vendor, "Signify", 0.6, &oui_detail(hue, "Signify"))
-            .ev(Src::Mdns, ClaimKind::DeviceType, "Smart home hub", 0.85, "_hue._tcp")
-            .ev(Src::Mdns, ClaimKind::Model, "Hue Bridge", 0.8, "_hue._tcp TXT modelid=BSB002"),
+        host(LanInfo {
+            mac: Some(hue),
+            ips: ip(60),
+            hostname: Some("Philips-hue".into()),
+            open_ports: vec![80, 443],
+            services: vec!["_hue._tcp".into()],
+            mdns: vec![svc("Hue Bridge - 1A2B3C", "_hue._tcp", 443, &["bridgeid=001788fffe1a2b3c", "modelid=BSB002"])],
+            upnp: Some(UpnpInfo {
+                friendly_name: Some("Hue Bridge (192.168.1.60)".into()),
+                manufacturer: Some("Signify".into()),
+                model_name: Some("Philips hue bridge 2015".into()),
+                model_number: Some("BSB002".into()),
+                device_type: Some("urn:schemas-upnp-org:device:Basic:1".into()),
+                ..Default::default()
+            }),
+            interface: wifi.clone(),
+            ..Default::default()
+        })
+        .ev(Src::Oui, ClaimKind::Vendor, "Signify", 0.6, &oui_detail(hue, "Signify")),
     );
 
     let plug = sim_mac("Espressif", 0x70_0070);
     out.push(
-        lan(plug, [192, 168, 1, 70], Some("ESP_3A1F2C"), &[6668], &[])
-            .ev(Src::Oui, ClaimKind::Vendor, "Espressif", 0.5, &oui_detail(plug, "Espressif (Wi-Fi chip)"))
-            .ev(Src::Banner, ClaimKind::DeviceType, "Smart plug", 0.5, "TCP 6668 open (Tuya local protocol)"),
+        host(LanInfo {
+            mac: Some(plug),
+            ips: ip(70),
+            hostname: Some("ESP_3A1F2C".into()),
+            open_ports: vec![6668],
+            interface: wifi.clone(),
+            ..Default::default()
+        })
+        .ev(Src::Oui, ClaimKind::Vendor, "Espressif", 0.5, &oui_detail(plug, "Espressif (Wi-Fi chip)")),
     );
 
     let cam = sim_mac("Reolink", 0x80_0080);
-    out.push(
-        lan(cam, [192, 168, 1, 80], None, &[80, 554, 9000], &["_http._tcp"])
-            .ev(Src::Banner, ClaimKind::DeviceType, "IP camera", 0.75, "RTSP on 554")
-            .ev(Src::Banner, ClaimKind::Vendor, "Reolink", 0.6, "HTTP title 'Reolink'"),
-    );
+    out.push(host(LanInfo {
+        mac: Some(cam),
+        ips: ip(80),
+        open_ports: vec![80, 554, 9000],
+        banners: vec![banner(80, "Server: nginx · title: Reolink")],
+        interface: wifi.clone(),
+        ..Default::default()
+    }));
 
     let pi = sim_mac("Raspberry Pi", 0x90_0090);
     out.push(
-        lan(pi, [192, 168, 1, 90], Some("raspberrypi"), &[22, 8123], &["_home-assistant._tcp", "_ssh._tcp"])
-            .ev(Src::Oui, ClaimKind::Vendor, "Raspberry Pi", 0.7, &oui_detail(pi, "Raspberry Pi Trading"))
-            .ev(Src::Banner, ClaimKind::Os, "Linux (Debian)", 0.7, "SSH banner OpenSSH_9.2p1 Debian")
-            .ev(Src::Heuristic, ClaimKind::DeviceType, "Single-board computer", 0.6, "Raspberry Pi OUI"),
+        host(LanInfo {
+            mac: Some(pi),
+            ips: ip(90),
+            hostname: Some("raspberrypi".into()),
+            open_ports: vec![22, 8123],
+            services: vec!["_home-assistant._tcp".into(), "_ssh._tcp".into()],
+            mdns: vec![svc("Home", "_home-assistant._tcp", 8123, &["version=2026.11.1", "base_url=http://192.168.1.90:8123"])],
+            banners: vec![banner(22, "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3")],
+            interface: wifi.clone(),
+            ..Default::default()
+        })
+        .ev(Src::Oui, ClaimKind::Vendor, "Raspberry Pi", 0.7, &oui_detail(pi, "Raspberry Pi Trading")),
     );
 
     let xbox = sim_mac("Microsoft", 0x33_0033);
     out.push(
-        lan(xbox, [192, 168, 1, 33], Some("XBOX"), &[3074], &[])
-            .ev(Src::Oui, ClaimKind::Vendor, "Microsoft", 0.6, &oui_detail(xbox, "Microsoft"))
-            .ev(Src::Banner, ClaimKind::DeviceType, "Game console", 0.6, "TCP 3074 (Xbox Live)"),
+        host(LanInfo {
+            mac: Some(xbox),
+            ips: ip(33),
+            hostname: Some("XBOX".into()),
+            open_ports: vec![3074],
+            interface: wifi,
+            ..Default::default()
+        })
+        .ev(Src::Oui, ClaimKind::Vendor, "Microsoft", 0.6, &oui_detail(xbox, "Microsoft")),
     );
 }
 
@@ -802,6 +926,20 @@ mod tests {
             .collect();
         for expected in ["Headphones", "Tracker tag", "Desktop PC", "Mouse", "Vehicle", "Heart-rate sensor", "Laptop"] {
             assert!(types.contains(&expected), "no {expected} in {types:?}");
+        }
+    }
+
+    #[test]
+    fn lan_hosts_are_identified_by_the_real_rules() {
+        let w = SimWorld::new(&SimConfig::default(), &BtDb::builtin());
+        let types: Vec<String> = w
+            .devices
+            .iter()
+            .filter(|d| matches!(d.key, DeviceKey::LanMac(_)))
+            .filter_map(|d| crate::identify::classify(&d.evidence).device_type.map(|c| c.value))
+            .collect();
+        for expected in ["Router", "Printer", "Media streamer", "NAS", "IP camera", "TV", "Smart home hub", "Game console"] {
+            assert!(types.iter().any(|t| t == expected), "no {expected} in {types:?}");
         }
     }
 

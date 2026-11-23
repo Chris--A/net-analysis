@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use na_engine::identify::ble::describe_manufacturer;
-use na_engine::{BleConfig, BtDb, Engine, EngineConfig, SimConfig};
+use na_engine::{BleConfig, BtDb, Engine, EngineConfig, LanConfig, SimConfig};
 use na_model::{Alert, Device, DeviceDetails, DeviceId, EngineEvent, SourceKind, SourceState};
 
 #[derive(Parser)]
@@ -48,6 +48,19 @@ enum Cmd {
         /// Skip the Classic discovery inquiry (only report connected Classic devices).
         #[arg(long)]
         no_inquiry: bool,
+    },
+    /// Discover hosts on the local network (ARP table, mDNS, SSDP/UPnP, NetBIOS).
+    Lan {
+        /// How long to collect for.
+        #[arg(long, default_value_t = 12)]
+        secs: u64,
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Also sweep the subnet and check a short list of TCP ports with banner grabs.
+        /// Only on networks you own or are authorized to test.
+        #[arg(long)]
+        active: bool,
     },
     /// Scan nearby Wi-Fi access points with this machine's adapter.
     Wifi {
@@ -102,6 +115,19 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&snapshot.to_json())?);
             } else {
                 snapshot.print_ble_table();
+            }
+        }
+        Cmd::Lan { secs, json, active } => {
+            let cfg = EngineConfig {
+                sources: vec![SourceKind::Lan],
+                lan: LanConfig { active, ..LanConfig::default() },
+                ..EngineConfig::default()
+            };
+            let snapshot = collect(cfg, Duration::from_secs(secs))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshot.to_json())?);
+            } else {
+                snapshot.print_lan_table();
             }
         }
         Cmd::Wifi { secs, json } => {
@@ -313,6 +339,58 @@ impl Snapshot {
             "\n{le} LE + {} Classic devices  (● connected, ○ paired; rpa/nrpa = rotating private address)",
             self.devices.len() - le
         );
+    }
+}
+
+impl Snapshot {
+    #[allow(clippy::print_literal)] // aligned header
+    fn print_lan_table(&self) {
+        for (k, v) in &self.sources {
+            eprintln!("source {:<8} {v:?}", k.label());
+        }
+        println!("{:<15} {:<18} {:<24} {:<36} {}", "IP", "MAC", "NAME", "IDENTITY", "SEEN VIA");
+        let mut hosts: Vec<&Device> = self.devices.values().filter(|d| d.lan().is_some()).collect();
+        hosts.sort_by_key(|d| d.lan().and_then(|l| l.ips.first().copied()));
+        for d in hosts {
+            let Some(l) = d.lan() else { continue };
+            let ip = l.ips.iter().find(|ip| ip.is_ipv4()).map_or_else(|| "-".into(), |ip| ip.to_string());
+            let mac = l.mac.map_or_else(
+                || "-".into(),
+                |m| format!("{m}{}", if m.is_locally_administered() { "*" } else { "" }),
+            );
+            let mut via: Vec<String> = Vec::new();
+            if l.is_self {
+                via.push("this machine".into());
+            }
+            if l.is_gateway {
+                via.push("gateway".into());
+            }
+            if !l.services.is_empty() {
+                via.push(format!("mDNS {}", l.services.join(" ")));
+            }
+            if let Some(u) = &l.upnp {
+                via.push(format!("UPnP {}", u.model_name.as_deref().or(u.server.as_deref()).unwrap_or("")));
+            }
+            if let Some(nb) = &l.netbios {
+                via.push(format!("NetBIOS {}", nb.name.as_deref().unwrap_or("")));
+            }
+            if !l.open_ports.is_empty() {
+                let p: Vec<String> = l.open_ports.iter().map(u16::to_string).collect();
+                via.push(format!("ports {}", p.join(",")));
+            }
+            if let Some(i) = &l.interface {
+                via.push(format!("on {i}"));
+            }
+            println!(
+                "{:<15} {:<18} {:<24} {:<36} {}",
+                ip,
+                mac,
+                truncate(&d.display_name(), 24),
+                truncate(&d.identity.summary().unwrap_or_default(), 36),
+                via.join("; ")
+            );
+        }
+        println!("\n{} hosts  (* = randomized / private MAC)", self.devices.len());
     }
 }
 

@@ -5,4 +5,5 @@
 //! so it is shared by every platform and unit-testable anywhere.
 
 pub mod bluetooth;
+pub mod net;
 pub mod wifi;

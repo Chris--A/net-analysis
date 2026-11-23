@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::identify::{BtDb, OuiDb};
 use crate::sources::{self, ObservationSink, SourceCtx, SourceDeps};
-use crate::{BleConfig, DeviceStore, SimConfig, WifiConfig};
+use crate::{BleConfig, DeviceStore, LanConfig, SimConfig, WifiConfig};
 
 /// How long each device class may go unseen before it is dropped.
 #[derive(Clone, Copy, Debug)]
@@ -27,7 +27,8 @@ impl Default for StalePolicy {
             bluetooth: Duration::from_secs(30),
             bt_classic: Duration::from_secs(240),
             wifi: Duration::from_secs(60),
-            lan: Duration::from_secs(300),
+            // Quiet hosts are only re-confirmed by discovery rounds and ARP traffic.
+            lan: Duration::from_secs(600),
         }
     }
 }
@@ -39,6 +40,7 @@ pub struct EngineConfig {
     pub sim: SimConfig,
     pub wifi: WifiConfig,
     pub ble: BleConfig,
+    pub lan: LanConfig,
     /// How often changed devices are pushed to the frontend.
     pub flush_interval: Duration,
     pub stale: StalePolicy,
@@ -51,6 +53,7 @@ impl Default for EngineConfig {
             sim: SimConfig::default(),
             wifi: WifiConfig::default(),
             ble: BleConfig::default(),
+            lan: LanConfig::default(),
             flush_interval: Duration::from_millis(200),
             stale: StalePolicy::default(),
         }
@@ -60,7 +63,7 @@ impl Default for EngineConfig {
 impl EngineConfig {
     /// Real scanners available on this platform (simulator excluded).
     pub fn real_sources() -> Vec<SourceKind> {
-        vec![SourceKind::Wifi, SourceKind::Ble]
+        vec![SourceKind::Wifi, SourceKind::Ble, SourceKind::Lan]
     }
 }
 
@@ -140,11 +143,13 @@ async fn run(
         tokio::task::spawn_blocking(OuiDb::load_default),
         tokio::task::spawn_blocking(BtDb::load_default),
     );
+    let (lan_active, lan_active_rx) = tokio::sync::watch::channel(cfg.lan.active);
     let spawner = Spawner {
         cfg: &cfg,
         deps: SourceDeps {
             oui: std::sync::Arc::new(oui.unwrap_or_default()),
             bt: std::sync::Arc::new(bt.unwrap_or_default()),
+            lan_active: lan_active_rx,
         },
         obs_tx: &obs_tx,
         evt_tx: &evt_tx,
@@ -171,6 +176,10 @@ async fn run(
                     if let Some(r) = running.remove(&source) {
                         r.cancel.cancel();
                     }
+                }
+                Ok(EngineCommand::SetActiveProbes { enabled }) => {
+                    info!(enabled, "LAN active probing");
+                    let _ = lan_active.send(enabled);
                 }
                 Ok(EngineCommand::Shutdown) | Err(_) => break,
             },

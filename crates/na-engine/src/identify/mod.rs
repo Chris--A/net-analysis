@@ -6,12 +6,14 @@ use std::path::PathBuf;
 pub mod ble;
 mod bt_sig;
 mod classifier;
+mod lan;
 mod oui;
 mod wifi;
 
 pub use ble::{appearance_label, ble_evidence, class_of_device_label, classic_evidence};
 pub use bt_sig::BtDb;
 pub use classifier::classify;
+pub use lan::lan_evidence;
 pub use oui::{OuiDb, short_name};
 pub use wifi::{VendorIeKind, ap_evidence, vendor_ie_info};
 

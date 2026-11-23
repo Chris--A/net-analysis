@@ -357,6 +357,9 @@ fn classic_details(ui: &mut egui::Ui, c: &BtClassicInfo) {
     });
 }
 
+/// TXT keys worth showing up front; the rest stay in the collapsible list.
+const KEY_TXT: &[&str] = &["fn", "md", "model", "am", "rpMd", "ty", "usb_MFG", "usb_MDL", "product", "manufacturer"];
+
 fn lan_details(ui: &mut egui::Ui, l: &LanInfo) {
     section(ui, "LAN host");
     egui::Grid::new("lan").num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
@@ -375,12 +378,8 @@ fn lan_details(ui: &mut egui::Ui, l: &LanInfo) {
         if let Some(h) = &l.hostname {
             kv(ui, "Hostname", h.as_str());
         }
-        if !l.open_ports.is_empty() {
-            let ports: Vec<String> = l.open_ports.iter().map(|p| p.to_string()).collect();
-            kv(ui, "Open ports", RichText::new(ports.join(", ")).monospace());
-        }
-        if !l.services.is_empty() {
-            kv(ui, "Services", l.services.join(", "));
+        if let Some(i) = &l.interface {
+            kv(ui, "Interface", i.as_str());
         }
         if l.is_gateway {
             kv(ui, "Role", RichText::new("default gateway").color(ACCENT));
@@ -388,5 +387,92 @@ fn lan_details(ui: &mut egui::Ui, l: &LanInfo) {
         if l.is_self {
             kv(ui, "Role", RichText::new("this machine").color(ACCENT));
         }
+        if let Some(nb) = &l.netbios {
+            let mut t = nb.name.clone().unwrap_or_default();
+            if let Some(g) = &nb.group {
+                t.push_str(&format!("  (workgroup {g})"));
+            }
+            if nb.file_server {
+                t.push_str("  · file sharing");
+            }
+            kv(ui, "NetBIOS", t);
+        }
+        if !l.open_ports.is_empty() {
+            let ports: Vec<String> = l.open_ports.iter().map(|p| p.to_string()).collect();
+            kv(ui, "Open ports", RichText::new(ports.join(", ")).monospace());
+        }
+        for b in &l.banners {
+            kv(ui, &format!("Banner :{}", b.port), RichText::new(&b.text).monospace().small());
+        }
     });
+
+    if let Some(u) = &l.upnp {
+        section(ui, "UPnP / SSDP");
+        egui::Grid::new("upnp").num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+            for (k, v) in [
+                ("Name", &u.friendly_name),
+                ("Manufacturer", &u.manufacturer),
+                ("Model", &u.model_name),
+                ("Model no.", &u.model_number),
+                ("Description", &u.model_description),
+                ("Server", &u.server),
+            ] {
+                if let Some(v) = v {
+                    kv(ui, k, v.as_str());
+                }
+            }
+            if let Some(t) = &u.device_type {
+                kv(ui, "Device type", RichText::new(short_urn(t)).monospace().small());
+            }
+        });
+        if !u.advertised.is_empty() {
+            egui::CollapsingHeader::new(format!("Advertised types ({})", u.advertised.len()))
+                .id_salt("upnp_st")
+                .show(ui, |ui| {
+                    for st in &u.advertised {
+                        ui.label(RichText::new(st).monospace().small().color(WEAK));
+                    }
+                });
+        }
+    }
+
+    if !l.services.is_empty() || !l.mdns.is_empty() {
+        section(ui, "mDNS / DNS-SD");
+        for m in &l.mdns {
+            let port = m.port.map(|p| format!(" :{p}")).unwrap_or_default();
+            ui.label(RichText::new(format!("{}  ·  {}{port}", m.instance, m.service)).size(12.5));
+            for key in KEY_TXT {
+                if let Some(v) = m.txt_value(key) {
+                    ui.label(RichText::new(format!("    {key} = {v}")).monospace().small().color(ACCENT));
+                }
+            }
+        }
+        let bare: Vec<&str> = l
+            .services
+            .iter()
+            .filter(|s| !l.mdns.iter().any(|m| &m.service == *s))
+            .map(String::as_str)
+            .collect();
+        if !bare.is_empty() {
+            ui.label(RichText::new(format!("Also advertises: {}", bare.join(", "))).small().color(WEAK));
+        }
+        let txt_count: usize = l.mdns.iter().map(|m| m.txt.len()).sum();
+        if txt_count > 0 {
+            egui::CollapsingHeader::new(format!("All TXT records ({txt_count})"))
+                .id_salt("mdns_txt")
+                .show(ui, |ui| {
+                    for m in l.mdns.iter().filter(|m| !m.txt.is_empty()) {
+                        ui.label(RichText::new(&m.service).small().strong());
+                        for kv in &m.txt {
+                            ui.label(RichText::new(format!("    {kv}")).monospace().small().color(WEAK));
+                        }
+                    }
+                });
+        }
+    }
+}
+
+/// `urn:schemas-upnp-org:device:MediaRenderer:1` → `MediaRenderer:1`.
+fn short_urn(t: &str) -> &str {
+    t.rmatch_indices(':').nth(1).map_or(t, |(i, _)| &t[i + 1..])
 }

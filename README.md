@@ -13,8 +13,8 @@ Written in Rust: a headless engine plus a [Bevy](https://bevyengine.org) + egui 
 | **M0** | Workspace, data model, engine + simulator, CLI, 3D shell with 3 views | ✅ done |
 | **M1** | Windows Wi-Fi scanning (wlanapi), 802.11 IE parser, OUI vendor lookup | ✅ done |
 | **M2** | Bluetooth LE + Classic scanning, AD parser, vendor-protocol decoders | ✅ done |
-| M3 | LAN discovery (ARP, mDNS, SSDP, NetBIOS, port/banner probes) | next |
-| M4 | Guard: evil twin, downgrade, Karma, PMF, baselines, alerts | |
+| **M3** | LAN discovery: ARP table, mDNS, SSDP/UPnP, NetBIOS, opt-in port/banner probes | ✅ done |
+| M4 | Guard: evil twin, downgrade, Karma, PMF, baselines, alerts | next |
 | M5 | Packet capture (Npcap/libpcap): DHCP/TCP fingerprints, ARP spoof, rogue DHCP | |
 | M6 | Linux port (nl80211, BlueZ, rtnetlink), monitor-mode detectors | |
 | M7 | Time scrubber, export, packaging, CI | |
@@ -44,6 +44,25 @@ Identification uses:
 
 Address types are tracked: public, random static, or rotating private (RPA/NRPA). Rotating devices get a new identity every ~15 min, which is expected, not suspicious.
 
+**LAN (M3).** Discovery is passive or uses standard protocols by default:
+- the OS neighbor (ARP) table
+- this machine (maker and model read from firmware) and the default gateway
+- **mDNS / DNS-SD** queries, which collect service types, instance names and TXT records
+- **SSDP** plus each device's own **UPnP description**: name, manufacturer, model, device type
+- **NetBIOS** name queries to hosts already seen
+
+**Active probes** are opt-in: the top-bar switch with a confirmation, or `na lan --active`. They nudge every address on the local subnets and check a short fixed list of TCP ports on each host, reading SSH/FTP greetings and HTTP `Server` headers and titles. Only use them on networks you own or are authorized to test.
+
+Identification uses:
+- self-descriptions (UPnP fields, Chromecast `md`/`fn`, Apple model identifiers, IPP printer `ty`)
+- service types
+- host names
+- NetBIOS
+- banners and ports
+- the OUI
+
+A host first seen only by IP merges into its MAC-keyed device once ARP resolves it. A LAN MAC that sits next to a BSSID (the router, or a phone hotspot) is linked to that AP.
+
 **Simulator.** `--sim` replaces the real scanners with a synthetic world: a home mesh, neighbours, LAN hosts and BLE devices. After 20 s an **evil twin** of `HomeNet` appears (open, locally-administered BSSID, just-booted TSF). A "SIMULATED DATA" badge shows while it runs.
 
 ## Setup
@@ -64,7 +83,9 @@ If any is off, the Wi-Fi source shows *unavailable* with this hint. It retries e
 
 **Bluetooth** needs no permission or admin rights on Windows, just Bluetooth turned on. If it's off, the source shows *unavailable* and resumes when it comes back.
 
-**Linux** (build/run; Wi-Fi and Bluetooth scanning arrive in M6): Bevy needs a few system packages, and a VM needs a software Vulkan/GL driver:
+**LAN discovery** needs no admin rights. Windows Firewall's default "allow unicast response to multicast" setting lets mDNS and SSDP replies through.
+
+**Linux** (build/run; LAN discovery already works; Wi-Fi and Bluetooth scanning arrive in M6): Bevy needs a few system packages, and a VM needs a software Vulkan/GL driver:
 
 ```sh
 sudo apt install build-essential pkg-config libudev-dev libasound2-dev \
@@ -88,6 +109,9 @@ cargo run -p na-cli -- wifi --secs 15 --json
 cargo run -p na-cli -- ble                        # LE + Classic devices (15 s, one inquiry)
 cargo run -p na-cli -- ble --secs 30 --fast       # continuous scan: more adverts, costs Wi-Fi airtime
 cargo run -p na-platform --example bt_probe 10 inquiry   # raw platform output, no decoding
+cargo run -p na-cli -- lan                        # LAN hosts (passive + standard discovery)
+cargo run -p na-cli -- lan --secs 30 --active     # + subnet sweep and port/banner probes (your networks only)
+cargo run -p na-platform --example net_probe      # interfaces, gateway, ARP table
 cargo run -p na-cli -- sim --secs 5
 
 # Tests
@@ -100,6 +124,7 @@ Cross-check the scanner against the OS with `netsh wlan show networks mode=bssid
 - **Left-drag**: orbit. **Right-drag**: pan. **Scroll**: zoom.
 - **Click** a device to inspect it. **Esc** clears the selection.
 - Click a source chip in the top bar to start or stop that source. Hover a chip to see why a source is unavailable.
+- **Active probes** in the top bar turns LAN probing on, after a confirmation, and off again.
 
 ## Layout
 
@@ -109,14 +134,18 @@ crates/
   na-platform/   OS access behind portable traits (blocking, raw data only)
     src/wifi/windows.rs        Native Wi-Fi API (wlanapi.dll)
     src/bluetooth/windows.rs   WinRT LE watcher + device enumeration, Win32 Classic inquiry
+    src/net/                   interfaces/gateway (netdev), ARP table (GetIpNetTable2, /proc/net/arp), SMBIOS
   na-engine/     tokio engine on its own thread: sources → DeviceStore → identify → (guard)
     src/parse/ie.rs           802.11 information-element decoder + fingerprint
     src/parse/ble_ad.rs       BLE advertising-data decoder
+    src/parse/{dns,upnp,netbios}.rs   mDNS/DNS-SD, SSDP + UPnP description + HTTP, NBSTAT
     src/sources/wifi.rs       Wi-Fi source (blocking scan thread, permission retry)
     src/sources/ble.rs        Bluetooth source (advert merging, connected poll, Classic inquiry)
+    src/sources/lan/          LAN source: host table, discovery rounds, opt-in sweep/probes
     src/sources/sim.rs        synthetic world incl. evil-twin scenario
     src/identify/             OUI + Bluetooth SIG registries, AP and Bluetooth evidence
-                              (Continuity, CDP, Fast Pair, appearance, CoD), noisy-OR classifier
+                              (Continuity, CDP, Fast Pair, appearance, CoD), LAN rules
+                              (UPnP, TXT, services, banners, host names), noisy-OR classifier
   na-cli/        `na` binary: headless JSON/table output for testing
   na-app/        Bevy + egui frontend
     src/bridge.rs   engine events → Registry resource + one entity per device

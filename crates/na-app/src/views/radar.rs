@@ -64,8 +64,13 @@ pub fn layout(
             _ => {
                 let az = unit_hash(d.id.0, 1) * TAU + drift;
                 let el = (unit_hash(d.id.0, 2) - 0.5) * 1.1;
-                // Connected devices stop advertising (no RSSI) but are close by definition.
-                let signal = if d.rssi.is_none() && connected(d) { 0.85 } else { signal01(d.rssi) };
+                let signal = match d.rssi {
+                    Some(_) => signal01(d.rssi),
+                    // Connected devices stop advertising (no RSSI) but are close by definition.
+                    None if connected(d) => 0.85,
+                    // No reading at all (Classic inquiry reports none): neither near nor far.
+                    None => 0.5,
+                };
                 let r = R_BLE_IN + (1.0 - signal) * (R_BLE_OUT - R_BLE_IN);
                 LayoutTarget::new(spherical(r, az, el), Quat::IDENTITY, Vec3::splat(0.55))
             }

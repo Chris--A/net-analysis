@@ -13,3 +13,4 @@ tokio-util.workspace = true
 flume.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+socket2 = { version = "0.6", features = ["all"] }

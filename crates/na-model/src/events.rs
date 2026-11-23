@@ -66,5 +66,8 @@ pub enum EngineEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EngineCommand {
     SetSourceEnabled { source: SourceKind, enabled: bool },
+    /// LAN active probing: subnet sweep and port/banner checks. Off by default;
+    /// only for networks you own or are authorized to test.
+    SetActiveProbes { enabled: bool },
     Shutdown,
 }

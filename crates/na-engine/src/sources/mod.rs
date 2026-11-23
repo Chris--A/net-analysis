@@ -12,6 +12,7 @@ use crate::EngineConfig;
 use crate::identify::{BtDb, OuiDb};
 
 pub mod ble;
+pub mod lan;
 pub mod sim;
 pub mod wifi;
 
@@ -59,6 +60,8 @@ impl SourceCtx {
 pub struct SourceDeps {
     pub oui: Arc<OuiDb>,
     pub bt: Arc<BtDb>,
+    /// Live LAN active-probing switch (see `EngineCommand::SetActiveProbes`).
+    pub lan_active: tokio::sync::watch::Receiver<bool>,
 }
 
 pub trait Source: Send + 'static {
@@ -78,7 +81,7 @@ pub fn make_source(
         SourceKind::Sim => Ok(Box::new(sim::SimSource::new(cfg.sim.clone(), deps.bt.clone()))),
         SourceKind::Wifi => Ok(Box::new(wifi::WifiSource::new(cfg.wifi.clone(), deps.oui.clone()))),
         SourceKind::Ble => Ok(Box::new(ble::BleSource::new(cfg.ble.clone(), deps.oui.clone(), deps.bt.clone()))),
-        SourceKind::Lan => Err("not implemented yet (milestone M3)".into()),
+        SourceKind::Lan => Ok(Box::new(lan::LanSource::new(cfg.lan.clone(), deps.oui.clone(), deps.lan_active.clone()))),
         SourceKind::Capture => Err("not implemented yet (milestone M5)".into()),
     }
 }

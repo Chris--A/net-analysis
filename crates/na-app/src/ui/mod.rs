@@ -43,6 +43,10 @@ pub struct UiState {
     pub paused: bool,
     pub search: String,
     pub shown_kinds: HashSet<DeviceKind>,
+    /// LAN active probing, as last requested from the engine.
+    pub active_probes: bool,
+    /// The "enable active probing?" confirmation is open.
+    pub confirm_active: bool,
 }
 
 impl Default for UiState {
@@ -51,6 +55,8 @@ impl Default for UiState {
             paused: false,
             search: String::new(),
             shown_kinds: DeviceKind::ALL.into_iter().collect(),
+            active_probes: false,
+            confirm_active: false,
         }
     }
 }

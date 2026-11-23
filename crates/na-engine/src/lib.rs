@@ -11,6 +11,7 @@ mod store;
 pub use engine::{Engine, EngineConfig, EngineHandle, StalePolicy};
 pub use identify::{BtDb, OuiDb};
 pub use sources::ble::BleConfig;
+pub use sources::lan::LanConfig;
 pub use sources::sim::SimConfig;
 pub use sources::wifi::WifiConfig;
 pub use store::DeviceStore;

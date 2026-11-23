@@ -7,13 +7,19 @@ rust-version.workspace = true
 
 [dependencies]
 na-model.workspace = true
+# Interfaces, default gateway (with MAC) and DNS servers, on every OS.
+netdev = { version = "0.48", default-features = false, features = ["gateway"] }
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_Bluetooth",
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_WiFi",
+    "Win32_Networking_WinSock",
+    "Win32_System_Registry",
     "Win32_System_Time",
 ] }
 # WinRT: BLE advertisement watcher and Bluetooth device enumeration.

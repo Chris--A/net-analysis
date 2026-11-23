@@ -11,6 +11,7 @@ use na_model::DeviceKind;
 
 use crate::bridge::Registry;
 use crate::picking::Selection;
+use crate::ui::UiState;
 use crate::views::ViewMode;
 
 pub struct DevToolsPlugin {
@@ -47,6 +48,7 @@ fn shot(commands: &mut Commands, dir: &Path, name: &str) {
     commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
 }
 
+#[allow(clippy::too_many_arguments)] // Bevy system parameters
 fn run_tour(
     mut commands: Commands,
     time: Res<Time>,
@@ -54,6 +56,7 @@ fn run_tour(
     mut tour: ResMut<ScreenshotTour>,
     mut next_view: ResMut<NextState<ViewMode>>,
     mut sel: ResMut<Selection>,
+    mut ui_state: ResMut<UiState>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if time.elapsed_secs() < tour.next_at {
@@ -117,7 +120,35 @@ fn run_tour(
         }
         7 => {
             shot(&mut commands, &dir, "6-classic-selected.png");
+            (0.5, false)
+        }
+        8 => {
+            // The best-described LAN host (most evidence), shown in the LAN-centric view.
+            sel.selected = reg
+                .devices
+                .values()
+                .filter(|d| d.kind == DeviceKind::LanHost && !d.lan().is_some_and(|l| l.is_self))
+                .max_by_key(|d| d.evidence.len())
+                .map(|d| d.id);
+            next_view.set(ViewMode::Constellation);
+            (4.0, false)
+        }
+        9 => {
+            shot(&mut commands, &dir, "7-lan-selected.png");
+            (0.5, false)
+        }
+        10 => {
+            // Open (but never confirm) the active-probing dialog.
+            ui_state.confirm_active = true;
             (1.0, false)
+        }
+        11 => {
+            shot(&mut commands, &dir, "8-active-confirm.png");
+            (0.5, false)
+        }
+        12 => {
+            ui_state.confirm_active = false;
+            (0.5, false)
         }
         _ => (0.0, true),
     };
